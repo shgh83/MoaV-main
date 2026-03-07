@@ -1,0 +1,27 @@
+# wstunnel for wrapping WireGuard in WebSocket
+# Using pre-built binary for faster builds
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG WSTUNNEL_VERSION=10.5.2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Download pre-built binary based on architecture
+# Format: wstunnel_VERSION_linux_ARCH.tar.gz where ARCH is amd64 or arm64
+RUN curl -L -o wstunnel.tar.gz "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_${TARGETARCH}.tar.gz" && \
+    tar -xzf wstunnel.tar.gz && \
+    chmod +x wstunnel && \
+    rm wstunnel.tar.gz
+
+COPY scripts/wstunnel-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 443
+
+ENTRYPOINT ["/entrypoint.sh"]

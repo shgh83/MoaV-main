@@ -1,0 +1,172 @@
+#!/bin/bash
+set -euo pipefail
+
+# =============================================================================
+# Generate a single new user (called by user-add.sh)
+# =============================================================================
+
+source /app/lib/common.sh
+source /app/lib/wireguard.sh
+source /app/lib/amneziawg.sh
+source /app/lib/dnstt.sh
+source /app/lib/slipstream.sh
+source /app/lib/telemt.sh
+
+USER_ID="${1:-}"
+
+if [[ -z "$USER_ID" ]]; then
+    log_error "Usage: generate-single-user.sh <user_id>"
+    exit 1
+fi
+
+# Load state
+STATE_DIR="/state"
+source "$STATE_DIR/keys/reality.env"
+
+# Check if user already exists
+if [[ -d "$STATE_DIR/users/$USER_ID" ]]; then
+    log_error "User $USER_ID already exists"
+    exit 1
+fi
+
+# Generate credentials
+USER_UUID=$(sing-box generate uuid)
+USER_PASSWORD=$(pwgen -s 24 1)
+
+# Store credentials
+mkdir -p "$STATE_DIR/users/$USER_ID"
+cat > "$STATE_DIR/users/$USER_ID/credentials.env" <<EOF
+USER_ID=$USER_ID
+USER_UUID=$USER_UUID
+USER_PASSWORD=$USER_PASSWORD
+CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+
+log_info "Created credentials for $USER_ID"
+
+# Add to sing-box config
+CONFIG_FILE="/configs/sing-box/config.json"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    # Add to Reality inbound
+    jq --arg name "$USER_ID" --arg uuid "$USER_UUID" \
+        '(.inbounds[] | select(.tag == "vless-reality-in") | .users) += [{"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}]' \
+        "$CONFIG_FILE" > /tmp/config.tmp && mv -f /tmp/config.tmp "$CONFIG_FILE"
+
+    # Add to Trojan inbound
+    jq --arg name "$USER_ID" --arg password "$USER_PASSWORD" \
+        '(.inbounds[] | select(.tag == "trojan-tls-in") | .users) += [{"name": $name, "password": $password}]' \
+        "$CONFIG_FILE" > /tmp/config.tmp && mv -f /tmp/config.tmp "$CONFIG_FILE"
+
+    # Add to Hysteria2 inbound
+    jq --arg name "$USER_ID" --arg password "$USER_PASSWORD" \
+        '(.inbounds[] | select(.tag == "hysteria2-in") | .users) += [{"name": $name, "password": $password}]' \
+        "$CONFIG_FILE" > /tmp/config.tmp && mv -f /tmp/config.tmp "$CONFIG_FILE"
+
+    # Add to VLESS WS inbound (CDN)
+    jq --arg name "$USER_ID" --arg uuid "$USER_UUID" \
+        '(.inbounds[] | select(.tag == "vless-ws-in") | .users) += [{"name": $name, "uuid": $uuid}]' \
+        "$CONFIG_FILE" > /tmp/config.tmp && mv -f /tmp/config.tmp "$CONFIG_FILE"
+
+    log_info "Added $USER_ID to sing-box config"
+fi
+
+# Add to TrustTunnel config
+TRUSTTUNNEL_CREDS="/configs/trusttunnel/credentials.toml"
+if [[ -f "$TRUSTTUNNEL_CREDS" ]]; then
+    # Check if user already exists
+    if grep -q "username = \"$USER_ID\"" "$TRUSTTUNNEL_CREDS" 2>/dev/null; then
+        log_info "User $USER_ID already exists in TrustTunnel"
+    else
+        # Append new user
+        cat >> "$TRUSTTUNNEL_CREDS" <<EOF
+
+[[client]]
+username = "$USER_ID"
+password = "$USER_PASSWORD"
+EOF
+        log_info "Added $USER_ID to TrustTunnel credentials"
+    fi
+fi
+
+# Add to AmneziaWG config
+AWG_CONFIG="/configs/amneziawg/awg0.conf"
+if [[ -f "$AWG_CONFIG" ]]; then
+    # Check if user already exists
+    if grep -q "# $USER_ID" "$AWG_CONFIG" 2>/dev/null; then
+        log_info "User $USER_ID already exists in AmneziaWG"
+    else
+        # Generate client keys
+        AWG_CLIENT_PRIVATE=$(wg genkey)
+        AWG_CLIENT_PUBLIC=$(echo "$AWG_CLIENT_PRIVATE" | wg pubkey)
+
+        # Count existing peers for IP assignment
+        AWG_PEER_COUNT=$(grep -c '^\[Peer\]' "$AWG_CONFIG" 2>/dev/null) || true
+        AWG_PEER_COUNT=${AWG_PEER_COUNT:-0}
+        AWG_PEER_NUM=$((AWG_PEER_COUNT + 1))
+        AWG_CLIENT_IP="10.67.67.$((AWG_PEER_NUM + 1))"
+
+        # Save client credentials
+        cat > "$STATE_DIR/users/$USER_ID/amneziawg.env" <<EOF
+AWG_PRIVATE_KEY=$AWG_CLIENT_PRIVATE
+AWG_PUBLIC_KEY=$AWG_CLIENT_PUBLIC
+AWG_CLIENT_IP=$AWG_CLIENT_IP
+AWG_CLIENT_IP_V6=
+EOF
+
+        # Append peer to server config
+        cat >> "$AWG_CONFIG" <<EOF
+
+[Peer]
+# $USER_ID
+PublicKey = $AWG_CLIENT_PUBLIC
+AllowedIPs = $AWG_CLIENT_IP/32
+EOF
+        log_info "Added $USER_ID to AmneziaWG config"
+    fi
+fi
+
+# Add to telemt config
+TELEMT_CONFIG="/configs/telemt/config.toml"
+if [[ "${ENABLE_TELEMT:-true}" == "true" ]] && [[ -f "$TELEMT_CONFIG" ]]; then
+    telemt_generate_secret "$USER_ID"
+    telemt_add_user_to_config "$USER_ID" "$TELEMT_SECRET"
+fi
+
+# Generate bundle
+export STATE_DIR
+export USER_ID USER_UUID USER_PASSWORD
+export REALITY_PUBLIC_KEY REALITY_SHORT_ID
+export SERVER_IP="${SERVER_IP:-$(curl -s --max-time 5 https://api.ipify.org)}"
+export DOMAIN="${DOMAIN:-}"
+export REALITY_TARGET="${REALITY_TARGET:-dl.google.com:443}"
+export ENABLE_WIREGUARD="${ENABLE_WIREGUARD:-true}"
+export ENABLE_AMNEZIAWG="${ENABLE_AMNEZIAWG:-true}"
+export ENABLE_DNSTT="${ENABLE_DNSTT:-true}"
+export ENABLE_SLIPSTREAM="${ENABLE_SLIPSTREAM:-false}"
+export ENABLE_HYSTERIA2="${ENABLE_HYSTERIA2:-true}"
+export ENABLE_TRUSTTUNNEL="${ENABLE_TRUSTTUNNEL:-true}"
+export ENABLE_TELEMT="${ENABLE_TELEMT:-true}"
+export PORT_TELEMT="${PORT_TELEMT:-993}"
+export TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-dl.google.com}"
+export TELEMT_MAX_TCP_CONNS="${TELEMT_MAX_TCP_CONNS:-100}"
+export TELEMT_MAX_UNIQUE_IPS="${TELEMT_MAX_UNIQUE_IPS:-10}"
+export DNSTT_SUBDOMAIN="${DNSTT_SUBDOMAIN:-t}"
+export SLIPSTREAM_SUBDOMAIN="${SLIPSTREAM_SUBDOMAIN:-s}"
+# Construct CDN_DOMAIN from CDN_SUBDOMAIN + DOMAIN if not explicitly set
+if [[ -z "${CDN_DOMAIN:-}" && -n "${CDN_SUBDOMAIN:-}" && -n "${DOMAIN:-}" ]]; then
+    export CDN_DOMAIN="${CDN_SUBDOMAIN}.${DOMAIN}"
+else
+    export CDN_DOMAIN="${CDN_DOMAIN:-}"
+fi
+export CDN_WS_PATH="${CDN_WS_PATH:-/ws}"
+
+# Load Hysteria2 obfuscation password if available
+if [[ -f "$STATE_DIR/keys/clash-api.env" ]]; then
+    source "$STATE_DIR/keys/clash-api.env"
+    export HYSTERIA2_OBFS_PASSWORD
+fi
+
+/app/generate-user.sh "$USER_ID"
+
+log_info "User $USER_ID bundle generated at /outputs/bundles/$USER_ID/"

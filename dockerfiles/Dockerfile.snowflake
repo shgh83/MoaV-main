@@ -1,0 +1,36 @@
+# Tor Snowflake Proxy - Help users bypass censorship via Tor
+# https://snowflake.torproject.org/
+#
+# The official image is minimal, so we build our own with bandwidth limiting
+FROM golang:1.23-alpine AS builder
+
+ARG SNOWFLAKE_VERSION=2.11.0
+
+RUN apk add --no-cache git
+
+# Clone and build snowflake proxy (pinned to specific version)
+RUN git clone --depth 1 --branch v${SNOWFLAKE_VERSION} \
+    https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake.git /snowflake
+WORKDIR /snowflake/proxy
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -ldflags="-s -w" -o /bin/proxy
+
+# Final image
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    iproute2 \
+    ca-certificates
+
+# Copy the built binary
+COPY --from=builder /bin/proxy /bin/proxy
+
+# Copy entrypoint script
+COPY scripts/snowflake-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Create nobody user if it doesn't exist
+RUN adduser -D -u 65534 nobody 2>/dev/null || true
+
+ENTRYPOINT ["/entrypoint.sh"]

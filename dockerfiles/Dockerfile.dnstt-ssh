@@ -1,0 +1,79 @@
+# =============================================================================
+# MoaV dnstt-ssh — OpenSSH server reachable through the DNS tunnel
+#
+# Purpose: Provides SSH shell + SSH -D SOCKS5 access via the dnstt tunnel.
+#          Useful for server administration and as a fallback when sing-box
+#          is not running.  Upstream is set via DNSTT_UPSTREAM in dnstt env.
+#
+# The dnstt server forwards connections to this container when
+#   DNSTT_UPSTREAM=dnstt-ssh:2222
+# is set, rather than the default sing-box:1080.
+# =============================================================================
+
+FROM alpine:3.21
+
+# Install OpenSSH, bash, and helpers
+RUN apk add --no-cache \
+    openssh \
+    bash \
+    curl \
+    ca-certificates \
+    tzdata
+
+# Create the tunnel user (no shell login, only SSH key auth)
+RUN addgroup -S tunnel && \
+    adduser -S -G tunnel -s /bin/bash tunnel && \
+    mkdir -p /home/tunnel/.ssh && \
+    chmod 700 /home/tunnel/.ssh && \
+    chown -R tunnel:tunnel /home/tunnel
+
+# SSHD config hardened for tunnel-only use
+RUN mkdir -p /etc/ssh/sshd_config.d && \
+    ssh-keygen -A && \
+    cat > /etc/ssh/sshd_config <<'EOF'
+Port 2222
+ListenAddress 0.0.0.0
+Protocol 2
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# Auth: key only
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/tunnel/.ssh/authorized_keys
+
+# Permit tunnel uses only
+PermitTunnel no
+AllowTcpForwarding yes
+GatewayPorts no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTTY yes
+PrintMotd no
+PrintLastLog no
+
+# No root login ever
+PermitRootLogin no
+AllowUsers tunnel
+
+# Session limits
+MaxSessions 20
+MaxStartups 10:30:60
+
+# Logging
+SyslogFacility AUTH
+LogLevel INFO
+
+# Keep-alive: disconnect dead sessions after ~5 min
+ClientAliveInterval 60
+ClientAliveCountMax 5
+EOF
+
+EXPOSE 2222/tcp
+
+COPY scripts/dnstt-ssh-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

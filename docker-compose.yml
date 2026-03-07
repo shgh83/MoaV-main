@@ -1,0 +1,839 @@
+# =============================================================================
+# MoaV - Multi-protocol Circumvention Stack
+# =============================================================================
+
+networks:
+  moav_net:
+    driver: bridge
+
+volumes:
+  moav_certs:
+  moav_state:
+  moav_logs:
+  moav_conduit:
+  moav_prometheus:
+  moav_grafana:
+  moav_snowflake_logs:
+  moav_webroot:
+
+services:
+  # ===========================================================================
+  # SING-BOX: Primary multi-protocol proxy server
+  # Handles: Reality, Trojan, Hysteria2
+  # ===========================================================================
+  sing-box:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.sing-box
+      args:
+        SINGBOX_VERSION: ${SINGBOX_VERSION:-1.12.23}
+    container_name: moav-sing-box
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_HTTPS:-443}:443/tcp"      # Reality (VLESS)
+      - "${PORT_TROJAN:-8443}:8443/tcp"   # Trojan (backup)
+      - "${PORT_HYSTERIA:-443}:443/udp"   # Hysteria2 (QUIC)
+      - "${PORT_CDN:-2082}:2082/tcp"      # CDN WebSocket (VLESS+WS)
+    volumes:
+      - ./configs/sing-box:/etc/sing-box:ro
+      - moav_certs:/certs:ro
+      - moav_state:/state
+      - moav_logs:/var/log/sing-box
+    environment:
+      - TZ=${TZ:-UTC}
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD", "sing-box", "check", "-c", "/etc/sing-box/config.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      certbot:
+        condition: service_completed_successfully
+    profiles:
+      - proxy
+      - all
+
+  # ===========================================================================
+  # WSTUNNEL + WIREGUARD: WebSocket-wrapped VPN
+  # ===========================================================================
+  wstunnel:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.wstunnel
+      args:
+        WSTUNNEL_VERSION: ${WSTUNNEL_VERSION:-10.5.2}
+    container_name: moav-wstunnel
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs/wstunnel:/etc/wstunnel:ro
+      - moav_certs:/certs:ro
+      - moav_state:/state
+    environment:
+      - TZ=${TZ:-UTC}
+      - WSTUNNEL_LISTEN=0.0.0.0:8080
+      # Forward to wireguard container via Docker internal DNS
+      - WSTUNNEL_RESTRICT=moav-wireguard:51820
+    depends_on:
+      - wireguard
+    profiles:
+      - wireguard
+      - all
+
+  wireguard:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.wireguard
+    container_name: moav-wireguard
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_WIREGUARD:-51820}:51820/udp"
+    volumes:
+      - ./configs/wireguard:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+    privileged: true
+    profiles:
+      - wireguard
+      - all
+
+  # ===========================================================================
+  # DNS TUNNELS (dnstunnel profile): dns-router + dnstt + slipstream
+  # ===========================================================================
+
+  # DNS Router: Routes DNS queries to dnstt/slipstream by domain suffix
+  dns-router:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.dns-router
+    container_name: moav-dns-router
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_DNS:-53}:5353/udp"
+    environment:
+      - DNSTT_DOMAIN=${DNSTT_SUBDOMAIN:-t}.${DOMAIN}
+      - SLIPSTREAM_DOMAIN=${SLIPSTREAM_SUBDOMAIN:-s}.${DOMAIN}
+      - ENABLE_DNSTT=${ENABLE_DNSTT:-true}
+      - ENABLE_SLIPSTREAM=${ENABLE_SLIPSTREAM:-true}
+      - KNOCKER_SECRET=${KNOCKER_SECRET:-}    # Serves _knock.<domain> TXT token queries
+      - TZ=${TZ:-UTC}
+    profiles:
+      - dnstunnel
+      - all
+
+  # dnstt: DNS tunnel server (reliable, moderate speed)
+  dnstt:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.dnstt
+    container_name: moav-dnstt
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "5353"
+    ports:
+      - "${PORT_DNSTT_TCP:-853}:853/tcp"    # dnstt TCP mode (looks like DNS-over-TLS)
+    volumes:
+      - ./configs/dnstt:/etc/dnstt:ro
+      - moav_state:/state
+      - ./outputs:/outputs
+    environment:
+      - DNSTT_DOMAIN=${DNSTT_SUBDOMAIN:-t}.${DOMAIN}
+      - DNSTT_UPSTREAM=${DNSTT_UPSTREAM:-sing-box:1080}
+      - DNSTT_ENABLE_TCP=${DNSTT_ENABLE_TCP:-true}
+      - DNSTT_TCP_LISTEN=${DNSTT_TCP_LISTEN:-:853}
+      - DNSTT_MTU=${DNSTT_MTU:-1232}       # NoizDNS optimal MTU for Iran networks
+      - TZ=${TZ:-UTC}
+    depends_on:
+      sing-box:
+        condition: service_healthy
+    profiles:
+      - dnstunnel
+      - all
+
+  # dnstt-ssh: SSH server accessible through the DNS tunnel
+  # Provides SSH shell + SSH -D SOCKS5 as alternative to sing-box upstream
+  dnstt-ssh:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.dnstt-ssh
+    container_name: moav-dnstt-ssh
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "2222"
+    volumes:
+      - moav_state:/state
+    environment:
+      - DNSTT_SSH_PUBKEY=${DNSTT_SSH_PUBKEY:-}
+      - TZ=${TZ:-UTC}
+    profiles:
+      - dnstunnel
+      - all
+
+  # Slipstream: QUIC-over-DNS tunnel (1.5-5x faster than dnstt)
+  slipstream:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.slipstream
+      args:
+        SLIPSTREAM_VERSION: ${SLIPSTREAM_VERSION:-2026.02.22.1}
+    container_name: moav-slipstream
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "5354"
+    volumes:
+      - moav_state:/state
+    environment:
+      - SLIPSTREAM_DOMAIN=${SLIPSTREAM_SUBDOMAIN:-s}.${DOMAIN}
+      - SLIPSTREAM_UPSTREAM=sing-box:1080
+      - TZ=${TZ:-UTC}
+    depends_on:
+      sing-box:
+        condition: service_healthy
+    profiles:
+      - dnstunnel
+      - all
+
+  # ===========================================================================
+  # KNOCKER: HMAC-based connection admission proxy (GFK/DPI evasion)
+  # Sits in front of sing-box. Admits clients with valid time-window tokens,
+  # deflects DPI probe traffic to the decoy server.
+  # ===========================================================================
+  knocker:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.knocker
+    container_name: moav-knocker
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_KNOCKER:-8444}:8444/tcp"
+    volumes:
+      - moav_state:/state
+    environment:
+      - KNOCKER_LISTEN=:8444
+      - KNOCKER_UPSTREAM=${KNOCKER_UPSTREAM:-sing-box:1080}
+      - KNOCKER_DECOY=${KNOCKER_DECOY:-decoy:80}
+      - KNOCKER_SECRET=${KNOCKER_SECRET:-}
+      - TZ=${TZ:-UTC}
+    depends_on:
+      - decoy
+    profiles:
+      - proxy
+      - all
+
+  # ===========================================================================
+  # NAIVE: NaiveProxy — Caddy forward-proxy with authentic Chrome TLS fingerprint
+  # Traffic is indistinguishable from ordinary HTTPS browsing (HTTPS CONNECT)
+  # Source: https://github.com/klzgrad/naiveproxy
+  # ===========================================================================
+  naive:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.naive
+    container_name: moav-naive
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_NAIVE:-8443}:443/tcp"
+    volumes:
+      - moav_state:/state:ro
+      - moav_certs:/certs:ro
+      - ./scripts:/scripts:ro
+    environment:
+      - NAIVE_DOMAIN=${DOMAIN}
+      - NAIVE_USER=${NAIVE_USER:-naive}
+      - NAIVE_PASS=${NAIVE_PASS:-}
+      - TZ=${TZ:-UTC}
+    depends_on:
+      certbot:
+        condition: service_completed_successfully
+      decoy:
+        condition: service_started
+    profiles:
+      - proxy
+      - all
+
+  # ===========================================================================
+  # CERTBOT: TLS certificate management
+  # ===========================================================================
+  certbot:
+    image: ${IMAGE_CERTBOT:-certbot/certbot:latest}
+    container_name: moav-certbot
+    depends_on:
+      - decoy
+    volumes:
+      - moav_certs:/etc/letsencrypt
+      - moav_webroot:/acme
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL}
+    entrypoint: /bin/sh
+    command: >
+      -c '
+        if [ -z "${DOMAIN}" ]; then
+          echo "No domain configured, skipping certificate generation (domain-less mode)"
+          exit 0
+        fi
+        if [ ! -f /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ]; then
+          certbot certonly --webroot \
+            --webroot-path /acme \
+            --non-interactive \
+            --agree-tos \
+            --email ${ACME_EMAIL} \
+            --domains ${DOMAIN} \
+            --cert-name ${DOMAIN}
+        else
+          echo "Certificate already exists, skipping..."
+        fi
+      '
+    profiles:
+      - proxy
+      - wireguard
+      - dnstunnel
+      - trusttunnel
+      - all
+
+  # ===========================================================================
+  # DECOY: Static website (served by sing-box fallback)
+  # ===========================================================================
+  decoy:
+    image: ${IMAGE_NGINX:-nginx:alpine}
+    container_name: moav-decoy
+    restart: unless-stopped
+    networks:
+      - moav_net
+    tmpfs:
+      - /usr/share/nginx/html
+    volumes:
+      - ./web:/template:ro
+      - moav_webroot:/acme
+      - ./configs/decoy/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./configs/decoy/40-randomize.sh:/docker-entrypoint.d/40-randomize.sh:ro
+    ports:
+      - "80:80"
+    expose:
+      - "80"
+    profiles:
+      - proxy
+      - wireguard
+      - dnstunnel
+      - trusttunnel
+      - all
+
+  # ===========================================================================
+  # TELEMT: Telegram MTProxy with Fake-TLS V2
+  # Provides direct Telegram access with advanced DPI evasion
+  # ===========================================================================
+  telemt:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.telemt
+      args:
+        TELEMT_VERSION: ${TELEMT_VERSION:-3.1.5}
+    container_name: moav-telemt
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_TELEMT:-993}:993/tcp"
+    expose:
+      - "9090"
+    volumes:
+      - ./configs/telemt:/etc/telemt:ro
+    tmpfs:
+      - /app/tlsfront:rw,size=10m
+    environment:
+      - RUST_LOG=info
+      - TZ=${TZ:-UTC}
+    profiles:
+      - telegram
+      - all
+
+  # ===========================================================================
+  # PSIPHON CONDUIT: Bandwidth donation (optional)
+  # Donates your bandwidth to help others bypass censorship
+  # ===========================================================================
+  psiphon-conduit:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.psiphon
+      args:
+        CONDUIT_VERSION: ${CONDUIT_VERSION:-2.0.0}
+    container_name: moav-conduit
+    restart: unless-stopped
+    networks:
+      - moav_net
+    volumes:
+      - moav_conduit:/data
+    environment:
+      - TZ=${TZ:-UTC}
+      - CONDUIT_BANDWIDTH=${CONDUIT_BANDWIDTH:-200}
+      - CONDUIT_MAX_COMMON_CLIENTS=${CONDUIT_MAX_COMMON_CLIENTS:-100}
+    expose:
+      - "9090"
+    profiles:
+      - conduit
+      - all
+
+  # ===========================================================================
+  # SNOWFLAKE: Tor Snowflake proxy (bandwidth donation)
+  # Helps users bypass censorship via the Tor network
+  # ===========================================================================
+  snowflake:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.snowflake
+      args:
+        SNOWFLAKE_VERSION: ${SNOWFLAKE_VERSION:-2.11.0}
+    container_name: moav-snowflake
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - moav_snowflake_logs:/var/log/snowflake
+    environment:
+      - TZ=${TZ:-UTC}
+      - SNOWFLAKE_BANDWIDTH=${SNOWFLAKE_BANDWIDTH:-50}
+      - SNOWFLAKE_CAPACITY=${SNOWFLAKE_CAPACITY:-20}
+    cap_add:
+      - NET_ADMIN
+    profiles:
+      - snowflake
+      - all
+
+  # Snowflake Prometheus Exporter - parses snowflake logs for metrics
+  # Only runs with monitoring profile (requires Prometheus to scrape)
+  # Snowflake Exporter (custom optimized) - parses snowflake proxy logs
+  snowflake-exporter:
+    build:
+      context: ./exporters/snowflake
+      dockerfile: Dockerfile
+    container_name: moav-snowflake-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    volumes:
+      - moav_snowflake_logs:/var/log/snowflake:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    expose:
+      - "8080"
+    # Note: No depends_on as snowflake may not be running; exporter handles retry
+    profiles:
+      - monitoring
+      - all
+
+  # ===========================================================================
+  # AMNEZIAWG: DPI-resistant WireGuard fork
+  # Obfuscated WireGuard that defeats deep packet inspection
+  # ===========================================================================
+  amneziawg:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.amneziawg
+      args:
+        AWGTOOLS_VERSION: ${AWGTOOLS_VERSION:-1.0.20260223}
+    container_name: moav-amneziawg
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_AMNEZIAWG:-51821}:51821/udp"
+    volumes:
+      - ./configs/amneziawg:/etc/amneziawg
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.ip_forward=1
+    privileged: true
+    profiles:
+      - amneziawg
+      - all
+
+  # ===========================================================================
+  # TRUSTTUNNEL: Modern VPN protocol (looks like HTTPS)
+  # HTTP/2 + HTTP/3 (QUIC) transport, indistinguishable from regular web traffic
+  # ===========================================================================
+  trusttunnel:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.trusttunnel
+      args:
+        TRUSTTUNNEL_VERSION: ${TRUSTTUNNEL_VERSION:-0.9.125}
+    container_name: moav-trusttunnel
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_TRUSTTUNNEL:-4443}:4443/tcp"   # HTTP/2
+      - "${PORT_TRUSTTUNNEL:-4443}:4443/udp"   # HTTP/3 (QUIC)
+    volumes:
+      - ./configs/trusttunnel:/etc/trusttunnel:ro
+      - moav_certs:/certs:ro
+      - moav_state:/state
+      - moav_logs:/var/log/trusttunnel
+    environment:
+      - DOMAIN=${DOMAIN}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - TZ=${TZ:-UTC}
+    depends_on:
+      certbot:
+        condition: service_completed_successfully
+    profiles:
+      - trusttunnel
+      - all
+
+  # ===========================================================================
+  # ADMIN: Stats dashboard + User management API
+  # ===========================================================================
+  admin:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.admin
+    container_name: moav-admin
+    restart: unless-stopped
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_ADMIN:-9443}:8443"
+    volumes:
+      - .:/project                               # Full project for running user-add.sh
+      - /var/run/docker.sock:/var/run/docker.sock # Docker CLI for script service reloads
+      - moav_state:/state:ro                      # Dashboard reads keys from Docker volume
+      - moav_certs:/certs:ro                      # SSL certificates
+      - moav_conduit:/conduit-data:ro             # Conduit Ryve pairing link
+    environment:
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ADMIN_IP_WHITELIST=${ADMIN_IP_WHITELIST:-}
+      - TZ=${TZ:-UTC}
+    profiles:
+      - admin
+      - all
+
+  # ===========================================================================
+  # MONITORING: Prometheus + Grafana observability stack
+  # ===========================================================================
+  prometheus:
+    image: ${IMAGE_PROMETHEUS:-prom/prometheus:latest}
+    container_name: moav-prometheus
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "9091"
+    volumes:
+      - ./configs/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - moav_prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.listen-address=:9091'
+      - '--web.enable-lifecycle'
+    environment:
+      - TZ=${TZ:-UTC}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles:
+      - monitoring
+      - all
+
+  grafana:
+    image: ${IMAGE_GRAFANA:-grafana/grafana:latest}
+    container_name: moav-grafana
+    restart: unless-stopped
+    user: "0"
+    entrypoint: ["/bin/sh", "/scripts/grafana-entrypoint.sh"]
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_GRAFANA:-9444}:3000"
+    volumes:
+      - ./configs/monitoring/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./configs/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/monitoring/grafana/provisioning/dashboards:/var/lib/grafana/dashboards:ro
+      - ./site/assets:/branding:ro
+      - ./scripts/grafana-entrypoint.sh:/scripts/grafana-entrypoint.sh:ro
+      - moav_grafana:/var/lib/grafana
+      - moav_certs:/certs:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - GF_SECURITY_ADMIN_USER=admin
+      # Branding vars passed to entrypoint (direct file replacement, not GF_BRANDING_* which is Enterprise-only)
+      - DOMAIN=${DOMAIN:-}
+      - SERVER_IP=${SERVER_IP:-}
+      - GRAFANA_SUBDOMAIN=${GRAFANA_SUBDOMAIN:-}
+      - GRAFANA_APP_TITLE=${GRAFANA_APP_TITLE:-}
+      - TZ=${TZ:-UTC}
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+      - all
+
+  # Grafana Proxy - Routes grafana.${DOMAIN} through Cloudflare CDN for faster loading
+  # Uses port 2083 (Cloudflare-supported HTTPS port)
+  # Setup: Add DNS record grafana.yourdomain.xyz -> server IP (Cloudflare proxied, orange cloud)
+  grafana-proxy:
+    image: ${IMAGE_NGINX:-nginx:alpine}
+    container_name: moav-grafana-proxy
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/scripts/grafana-proxy-entrypoint.sh"]
+    networks:
+      - moav_net
+    ports:
+      - "${PORT_GRAFANA_PROXY:-2083}:443"
+    volumes:
+      - ./scripts/grafana-proxy-entrypoint.sh:/scripts/grafana-proxy-entrypoint.sh:ro
+      - moav_certs:/certs:ro
+    depends_on:
+      - grafana
+    profiles:
+      - monitoring
+      - all
+
+  node-exporter:
+    image: ${IMAGE_NODE_EXPORTER:-prom/node-exporter:latest}
+    container_name: moav-node-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    environment:
+      - TZ=${TZ:-UTC}
+    profiles:
+      - monitoring
+      - all
+
+  cadvisor:
+    # Use IMAGE_CADVISOR env var, or build locally with: moav build --local
+    image: ${IMAGE_CADVISOR:-gcr.io/cadvisor/cadvisor:latest}
+    container_name: moav-cadvisor
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    command:
+      - '--docker_only=true'
+      - '--housekeeping_interval=30s'
+      - '--store_container_labels=true'
+    environment:
+      - TZ=${TZ:-UTC}
+    profiles:
+      - monitoring
+      - all
+
+  clash-exporter:
+    # Use IMAGE_CLASH_EXPORTER env var, or build locally with: moav build --local
+    image: ${IMAGE_CLASH_EXPORTER:-ghcr.io/zxh326/clash-exporter:latest}
+    container_name: moav-clash-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    expose:
+      - "2112"
+    environment:
+      - CLASH_HOST=moav-sing-box:9090
+      - CLASH_TOKEN=${CLASH_API_SECRET:-}
+      - TZ=${TZ:-UTC}
+    command: ["-collectDest"]
+    profiles:
+      - monitoring
+      - all
+
+  # Sing-box User Exporter - parses sing-box logs for user connection metrics
+  singbox-exporter:
+    build:
+      context: ./exporters/singbox
+      dockerfile: Dockerfile
+    container_name: moav-singbox-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    expose:
+      - "9102"
+    # Note: No depends_on as sing-box may not be running; exporter handles retry
+    profiles:
+      - monitoring
+      - all
+
+  # WireGuard Exporter - custom exporter using docker exec
+  wireguard-exporter:
+    build:
+      context: ./exporters/wireguard
+      dockerfile: Dockerfile
+    container_name: moav-wireguard-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./configs/wireguard:/etc/wireguard:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    profiles:
+      - monitoring
+      - all
+
+  # AmneziaWG Exporter - custom per-peer traffic metrics
+  amneziawg-exporter:
+    build:
+      context: ./exporters/amneziawg
+      dockerfile: Dockerfile
+    container_name: moav-amneziawg-exporter
+    restart: unless-stopped
+    networks:
+      - moav_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./configs/amneziawg:/etc/amneziawg:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    profiles:
+      - monitoring
+      - all
+
+  # ===========================================================================
+  # BOOTSTRAP: First-run initialization
+  # ===========================================================================
+  bootstrap:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.bootstrap
+    container_name: moav-bootstrap
+    volumes:
+      - ./configs:/configs
+      - ./outputs:/outputs
+      - ./scripts:/scripts:ro
+      - ./docs:/docs:ro
+      - moav_state:/state
+      - moav_certs:/certs
+      - ./state:/host-state:ro    # Host state dir for users created via 'moav user add'
+    environment:
+      - DOMAIN=${DOMAIN}
+      - SERVER_IP=${SERVER_IP:-}
+      - INITIAL_USERS=${INITIAL_USERS:-5}
+      - REALITY_TARGET=${REALITY_TARGET:-dl.google.com:443}
+      - REALITY_SHORT_ID=${REALITY_SHORT_ID:-}
+      - REALITY_PRIVATE_KEY=${REALITY_PRIVATE_KEY:-}
+      - ENABLE_REALITY=${ENABLE_REALITY:-true}
+      - ENABLE_TROJAN=${ENABLE_TROJAN:-true}
+      - ENABLE_HYSTERIA2=${ENABLE_HYSTERIA2:-true}
+      - ENABLE_WIREGUARD=${ENABLE_WIREGUARD:-true}
+      - ENABLE_DNSTT=${ENABLE_DNSTT:-true}
+      - ENABLE_SLIPSTREAM=${ENABLE_SLIPSTREAM:-true}
+      - SLIPSTREAM_SUBDOMAIN=${SLIPSTREAM_SUBDOMAIN:-s}
+      - ENABLE_TRUSTTUNNEL=${ENABLE_TRUSTTUNNEL:-true}
+      - ENABLE_KNOCKER=${ENABLE_KNOCKER:-true}
+      - KNOCKER_SECRET=${KNOCKER_SECRET:-}
+      - DNSTT_SSH_PUBKEY=${DNSTT_SSH_PUBKEY:-}
+      - ENABLE_SHADOWSOCKS=${ENABLE_SHADOWSOCKS:-true}
+      - SS_PASSWORD=${SS_PASSWORD:-}
+      - SS_PORT=${SS_PORT:-8388}
+      - ENABLE_NAIVE=${ENABLE_NAIVE:-true}
+      - NAIVE_USER=${NAIVE_USER:-naive}
+      - NAIVE_PASS=${NAIVE_PASS:-}
+      - ENABLE_TELEMT=${ENABLE_TELEMT:-true}
+      - PORT_TELEMT=${PORT_TELEMT:-993}
+      - TELEMT_TLS_DOMAIN=${TELEMT_TLS_DOMAIN:-dl.google.com}
+      - TELEMT_MAX_TCP_CONNS=${TELEMT_MAX_TCP_CONNS:-100}
+      - TELEMT_MAX_UNIQUE_IPS=${TELEMT_MAX_UNIQUE_IPS:-10}
+      - ENABLE_AMNEZIAWG=${ENABLE_AMNEZIAWG:-true}
+      - PORT_AMNEZIAWG=${PORT_AMNEZIAWG:-51821}
+      - ENABLE_ADMIN_UI=${ENABLE_ADMIN_UI:-true}
+      - CDN_SUBDOMAIN=${CDN_SUBDOMAIN:-}
+      - CDN_DOMAIN=${CDN_DOMAIN:-}
+      - CDN_WS_PATH=${CDN_WS_PATH:-/ws}
+      - CDN_TRANSPORT=${CDN_TRANSPORT:-httpupgrade}
+      - CDN_SNI=${CDN_SNI:-}
+      - CDN_ADDRESS=${CDN_ADDRESS:-}
+    profiles:
+      - setup
+
+  # ===========================================================================
+  # CLIENT: Multi-protocol client for testing and connecting
+  # ===========================================================================
+  client:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.client
+      args:
+        SINGBOX_VERSION: ${SINGBOX_VERSION:-1.12.23}
+        WSTUNNEL_VERSION: ${WSTUNNEL_VERSION:-10.5.2}
+        SNOWFLAKE_VERSION: ${SNOWFLAKE_VERSION:-2.11.0}
+        TRUSTTUNNEL_CLIENT_VERSION: ${TRUSTTUNNEL_CLIENT_VERSION:-0.99.105}
+        AWGTOOLS_VERSION: ${AWGTOOLS_VERSION:-1.0.20260223}
+        SLIPSTREAM_VERSION: ${SLIPSTREAM_VERSION:-2026.02.22.1}
+    container_name: moav-client
+    volumes:
+      - ./outputs/bundles:/bundles:ro
+      - ./configs:/configs:ro
+    environment:
+      - TZ=${TZ:-UTC}
+    ports:
+      - "${CLIENT_SOCKS_PORT:-1080}:1080"
+      - "${CLIENT_HTTP_PORT:-8080}:8080"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    profiles:
+      - client

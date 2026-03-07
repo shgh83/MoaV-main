@@ -1,0 +1,67 @@
+# dnstt / NoizDNS tunnel server
+# Uses the NoizDNS release binary, which auto-detects both standard dnstt clients
+# AND NoizDNS clients (DPI-evasion hex-encoding) — same binary, no extra config.
+# Source: https://github.com/anonvector/noizdns-deploy
+FROM alpine:3.21 AS downloader
+
+ARG TARGETARCH
+ARG NOIZDNS_VERSION=latest
+
+RUN apk add --no-cache curl ca-certificates
+
+# Download NoizDNS binary (a drop-in dnstt-server that also handles NoizDNS encoding)
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    echo "Downloading NoizDNS dnstt-server for $ARCH ..." && \
+    curl -fsSL -o /dnstt-server \
+      "https://github.com/anonvector/noizdns-deploy/releases/latest/download/dnstt-server-linux-${ARCH}" && \
+    chmod +x /dnstt-server && \
+    echo "NoizDNS binary downloaded: $(ls -lh /dnstt-server)"
+
+# ----
+# Fallback builder: compile vanilla dnstt-server if the download failed or
+# the architecture is not yet published (e.g. arm/v7).  The build stage is
+# only used when the downloader stage leaves a zero-byte binary.
+FROM golang:1.24-alpine AS builder
+
+RUN apk add --no-cache git
+
+RUN git clone https://www.bamsoftware.com/git/dnstt.git /src
+
+ARG TARGETARCH
+ARG TARGETOS=linux
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd /src/dnstt-server && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
+    go build -o /dnstt-server-fallback -trimpath -ldflags "-s -w" .
+
+# ----
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata
+
+# Use NoizDNS binary; fall back to vanilla dnstt if the download failed
+COPY --from=downloader /dnstt-server /tmp/dnstt-noizdns
+COPY --from=builder    /dnstt-server-fallback /tmp/dnstt-vanilla
+
+RUN if [ -s /tmp/dnstt-noizdns ]; then \
+        mv /tmp/dnstt-noizdns /usr/local/bin/dnstt-server && \
+        echo "[dnstt] Using NoizDNS binary (auto-detects dnstt + NoizDNS clients)"; \
+    else \
+        mv /tmp/dnstt-vanilla /usr/local/bin/dnstt-server && \
+        echo "[dnstt] WARNING: Using vanilla dnstt-server (NoizDNS download failed)"; \
+    fi && \
+    chmod +x /usr/local/bin/dnstt-server && \
+    rm -f /tmp/dnstt-*
+
+RUN mkdir -p /etc/dnstt /state
+
+# 5353/udp — dnstt/NoizDNS UDP listener (redirected from :53)
+# 853/tcp  — TCP listener masquerading as DNS-over-TLS (optional)
+EXPOSE 5353/udp 853/tcp
+
+COPY scripts/dnstt-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

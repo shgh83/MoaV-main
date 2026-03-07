@@ -1,0 +1,228 @@
+# =============================================================================
+# MoaV Client - Multi-protocol client for testing and connecting
+# =============================================================================
+# Supports: Reality, Trojan, Hysteria2, WireGuard (via wstunnel),
+#           AmneziaWG, dnstt, Slipstream, TrustTunnel, Tor/Snowflake
+#
+# Strategy: Download pre-built binaries with proper architecture detection
+# =============================================================================
+
+# =============================================================================
+# Builder stage - compile dnstt (no official releases available)
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS dnstt-builder
+
+# For cross-compilation
+ARG TARGETARCH
+ARG TARGETOS=linux
+
+RUN apk add --no-cache git
+
+# Build dnstt-client with cross-compilation
+RUN git clone https://www.bamsoftware.com/git/dnstt.git /tmp/dnstt
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd /tmp/dnstt/dnstt-client && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -o /dnstt-client . || touch /dnstt-client
+
+# =============================================================================
+# Builder stage - compile knocker (HMAC admission proxy client)
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS knocker-builder
+
+ARG TARGETARCH
+ARG TARGETOS=linux
+
+# Copy knocker source
+COPY knocker/ /src/knocker/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd /src/knocker && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -ldflags='-s -w' -o /knocker . || touch /knocker
+
+# =============================================================================
+# Builder stage - download slipstream-client (Rust, glibc-linked)
+# Must run on Debian since the binary requires full glibc (__res_init, _Unwind_*)
+# =============================================================================
+FROM debian:bookworm-slim AS slipstream-builder
+
+ARG TARGETARCH
+ARG SLIPSTREAM_VERSION=2026.02.22.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    wget -qO /usr/local/bin/slipstream-client \
+    "https://github.com/net2share/slipstream-rust-build/releases/download/v${SLIPSTREAM_VERSION}/slipstream-client-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/slipstream-client
+
+# Bundle the glibc shared libs the binary needs so it runs on Alpine
+RUN mkdir -p /slipstream-libs && \
+    ldd /usr/local/bin/slipstream-client | grep -oP '/\S+' | \
+    while read lib; do cp "$lib" /slipstream-libs/; done && \
+    cp /lib64/ld-linux-x86-64.so.2 /slipstream-libs/ 2>/dev/null || \
+    cp /lib/ld-linux-aarch64.so.1 /slipstream-libs/ 2>/dev/null || true
+
+# Create a wrapper script that uses the bundled linker
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    if [ "$ARCH" = "arm64" ]; then \
+        LINKER="/slipstream-libs/ld-linux-aarch64.so.1"; \
+    else \
+        LINKER="/slipstream-libs/ld-linux-x86-64.so.2"; \
+    fi && \
+    echo '#!/bin/sh' > /slipstream-wrapper.sh && \
+    echo "exec $LINKER --library-path /slipstream-libs /usr/local/bin/slipstream-client-bin \"\$@\"" >> /slipstream-wrapper.sh && \
+    chmod +x /slipstream-wrapper.sh
+
+# =============================================================================
+# Final image - download pre-built binaries for correct architecture
+# =============================================================================
+FROM alpine:3.21
+
+# Architecture detection for multi-arch support
+ARG TARGETARCH
+
+# Versions - read from .env via docker-compose build args, with fallback defaults
+ARG SINGBOX_VERSION=1.12.23
+ARG WSTUNNEL_VERSION=10.5.2
+ARG SNOWFLAKE_VERSION=2.11.0
+ARG TRUSTTUNNEL_VERSION=0.9.125
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    bash \
+    curl \
+    wget \
+    jq \
+    ca-certificates \
+    iptables \
+    ip6tables \
+    iproute2 \
+    bind-tools \
+    tor \
+    && rm -rf /var/cache/apk/*
+
+# Architecture mapping helper script
+# TARGETARCH from buildx: amd64, arm64, arm/v7, etc.
+# Fallback to runtime detection if not set
+RUN echo '#!/bin/sh' > /tmp/get-arch.sh && \
+    echo 'if [ -n "$TARGETARCH" ]; then' >> /tmp/get-arch.sh && \
+    echo '  echo "$TARGETARCH"' >> /tmp/get-arch.sh && \
+    echo 'else' >> /tmp/get-arch.sh && \
+    echo '  case "$(uname -m)" in' >> /tmp/get-arch.sh && \
+    echo '    x86_64|amd64) echo "amd64" ;;' >> /tmp/get-arch.sh && \
+    echo '    aarch64|arm64) echo "arm64" ;;' >> /tmp/get-arch.sh && \
+    echo '    armv7l) echo "arm" ;;' >> /tmp/get-arch.sh && \
+    echo '    *) echo "amd64" ;;' >> /tmp/get-arch.sh && \
+    echo '  esac' >> /tmp/get-arch.sh && \
+    echo 'fi' >> /tmp/get-arch.sh && \
+    chmod +x /tmp/get-arch.sh
+
+# Determine architecture once
+RUN ARCH=$(/tmp/get-arch.sh) && echo "Building for architecture: $ARCH" && echo "$ARCH" > /tmp/arch
+
+# sing-box: download pre-built binary
+RUN ARCH=$(cat /tmp/arch) && \
+    echo "Downloading sing-box for ${ARCH}..." && \
+    wget -qO- "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${ARCH}.tar.gz" | \
+    tar xz -C /tmp && \
+    mv /tmp/sing-box-${SINGBOX_VERSION}-linux-${ARCH}/sing-box /usr/local/bin/ && \
+    chmod +x /usr/local/bin/sing-box && \
+    rm -rf /tmp/sing-box-* && \
+    echo "sing-box ${SINGBOX_VERSION} installed (${ARCH})"
+
+# wstunnel: download pre-built binary
+# wstunnel uses underscore in filename: linux_amd64, linux_arm64
+RUN ARCH=$(cat /tmp/arch) && \
+    echo "Downloading wstunnel for ${ARCH}..." && \
+    wget -qO- "https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_${ARCH}.tar.gz" | \
+    tar xz -C /usr/local/bin/ wstunnel && \
+    chmod +x /usr/local/bin/wstunnel && \
+    echo "wstunnel ${WSTUNNEL_VERSION} installed (${ARCH})" || \
+    echo "wstunnel: download failed (optional, needed for WireGuard-wstunnel)"
+
+# snowflake-client: download pre-built binary
+RUN ARCH=$(cat /tmp/arch) && \
+    echo "Downloading snowflake-client for ${ARCH}..." && \
+    wget -qO /usr/local/bin/snowflake-client \
+    "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/-/releases/v${SNOWFLAKE_VERSION}/downloads/client/snowflake-client-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/snowflake-client && \
+    echo "snowflake-client ${SNOWFLAKE_VERSION} installed (${ARCH})" || \
+    echo "snowflake-client: download failed (optional, needed for Tor)"
+
+# dnstt-client: copy cross-compiled binary from builder
+COPY --from=dnstt-builder /dnstt-client /usr/local/bin/dnstt-client
+RUN chmod +x /usr/local/bin/dnstt-client 2>/dev/null && \
+    echo "dnstt-client installed" || \
+    echo "dnstt-client: not available (optional)"
+
+# knocker-client: copy compiled knocker binary for HMAC admission proxy
+COPY --from=knocker-builder /knocker /usr/local/bin/knocker
+RUN chmod +x /usr/local/bin/knocker 2>/dev/null && \
+    echo "knocker installed" || \
+    echo "knocker: not available (optional)"
+
+# slipstream-client: copy from Debian builder (Rust binary needs full glibc)
+# Binary + bundled glibc libs + wrapper script that invokes via the bundled ld-linux
+COPY --from=slipstream-builder /usr/local/bin/slipstream-client /usr/local/bin/slipstream-client-bin
+COPY --from=slipstream-builder /slipstream-libs/ /slipstream-libs/
+COPY --from=slipstream-builder /slipstream-wrapper.sh /usr/local/bin/slipstream-client
+RUN chmod +x /usr/local/bin/slipstream-client /usr/local/bin/slipstream-client-bin && \
+    echo "slipstream-client installed (bundled glibc)"
+
+# trusttunnel-client: download CLI client from TrustTunnelClient repo
+# TrustTunnelClient uses: linux-x86_64, linux-aarch64
+ARG TRUSTTUNNEL_CLIENT_VERSION=0.99.105
+RUN ARCH=$(cat /tmp/arch) && \
+    case "$ARCH" in \
+        amd64) TT_ARCH="x86_64" ;; \
+        arm64) TT_ARCH="aarch64" ;; \
+        *) TT_ARCH="x86_64" ;; \
+    esac && \
+    echo "Downloading trusttunnel_client v${TRUSTTUNNEL_CLIENT_VERSION} for ${TT_ARCH}..." && \
+    wget -qO /tmp/tt.tar.gz \
+    "https://github.com/TrustTunnel/TrustTunnelClient/releases/download/v${TRUSTTUNNEL_CLIENT_VERSION}/trusttunnel_client-v${TRUSTTUNNEL_CLIENT_VERSION}-linux-${TT_ARCH}.tar.gz" && \
+    tar xzf /tmp/tt.tar.gz -C /tmp --strip-components=1 && \
+    mv /tmp/trusttunnel_client /usr/local/bin/ && \
+    chmod +x /usr/local/bin/trusttunnel_client && \
+    rm -rf /tmp/tt.tar.gz /tmp/*.md /tmp/LICENSE && \
+    echo "trusttunnel_client v${TRUSTTUNNEL_CLIENT_VERSION} installed (${TT_ARCH})" || \
+    echo "trusttunnel_client: download failed (optional)"
+
+# amneziawg: download awg-tools for AmneziaWG client support
+ARG AWGTOOLS_VERSION=1.0.20260223
+RUN cd /tmp && \
+    echo "Downloading awg-tools v${AWGTOOLS_VERSION}..." && \
+    wget -qO awg-tools.zip "https://github.com/amnezia-vpn/amneziawg-tools/releases/download/v${AWGTOOLS_VERSION}/alpine-3.19-amneziawg-tools.zip" && \
+    unzip -j awg-tools.zip -d /usr/local/bin/ && \
+    rm -f awg-tools.zip && \
+    chmod +x /usr/local/bin/awg /usr/local/bin/awg-quick && \
+    echo "awg-tools v${AWGTOOLS_VERSION} installed" || \
+    echo "awg-tools: download failed (optional, needed for AmneziaWG)"
+
+# Cleanup
+RUN rm -f /tmp/get-arch.sh /tmp/arch
+
+# Create directories
+RUN mkdir -p /config /app /state /var/log/moav
+
+# Copy scripts
+COPY scripts/client-entrypoint.sh /app/
+COPY scripts/client-test.sh /app/
+COPY scripts/client-connect.sh /app/
+RUN chmod +x /app/*.sh
+
+# Default ports for proxy mode
+# SOCKS5: 1080, HTTP: 8080
+EXPOSE 1080 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD curl -sf --socks5 127.0.0.1:1080 https://www.google.com/generate_204 || exit 1
+
+WORKDIR /app
+ENTRYPOINT ["/app/client-entrypoint.sh"]
+CMD ["--help"]

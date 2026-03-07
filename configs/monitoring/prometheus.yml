@@ -1,0 +1,69 @@
+# =============================================================================
+# Prometheus Configuration for MoaV Monitoring
+# =============================================================================
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9091']
+
+  # Node Exporter - System metrics (CPU, RAM, disk, network)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # cAdvisor - Container metrics
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  # sing-box via Clash Exporter (traffic metrics)
+  - job_name: 'clash'
+    static_configs:
+      - targets: ['clash-exporter:2112']
+
+  # sing-box User Exporter (user connection metrics from logs)
+  - job_name: 'singbox-users'
+    static_configs:
+      - targets: ['singbox-exporter:9102']
+    scrape_timeout: 10s
+
+  # WireGuard Exporter - custom exporter using docker exec
+  # NOTE: Only available when running with --profile wireguard
+  - job_name: 'wireguard'
+    static_configs:
+      - targets: ['wireguard-exporter:9586']
+    scrape_timeout: 10s
+
+  # AmneziaWG Exporter - per-peer traffic metrics
+  # NOTE: Only available when running with --profile amneziawg
+  - job_name: 'amneziawg'
+    static_configs:
+      - targets: ['amneziawg-exporter:9587']
+    scrape_timeout: 10s
+
+  # Conduit v2 native Prometheus metrics
+  # NOTE: Only available when running with --profile conduit
+  - job_name: 'conduit'
+    static_configs:
+      - targets: ['psiphon-conduit:9090']
+    scrape_timeout: 10s
+
+  # Snowflake Exporter - parses snowflake proxy logs for metrics
+  # NOTE: Only available when running with --profile snowflake
+  - job_name: 'snowflake'
+    static_configs:
+      - targets: ['snowflake-exporter:8080']
+    scrape_timeout: 10s
+
+  # telemt - Telegram MTProxy native Prometheus metrics
+  # NOTE: Only available when running with --profile telegram
+  - job_name: 'telemt'
+    static_configs:
+      - targets: ['telemt:9090']
+    scrape_timeout: 10s

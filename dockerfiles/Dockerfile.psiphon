@@ -1,0 +1,30 @@
+# Psiphon Conduit v2 - Donate bandwidth to help others bypass censorship
+# https://github.com/Psiphon-Inc/conduit
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG CONDUIT_VERSION=2.0.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Download the conduit binary from official Psiphon-Inc repo
+# Note: Release tags use format "release-cli-X.Y.Z"
+RUN curl -fL -o conduit "https://github.com/Psiphon-Inc/conduit/releases/download/release-cli-${CONDUIT_VERSION}/conduit-linux-${TARGETARCH}" && \
+    chmod +x conduit
+
+# Create data directory for conduit state
+RUN mkdir -p /data
+
+# Expose metrics endpoint
+EXPOSE 9090
+
+# Copy entrypoint
+COPY scripts/conduit-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

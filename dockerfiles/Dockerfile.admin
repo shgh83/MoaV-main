@@ -1,0 +1,28 @@
+# Admin stats dashboard
+FROM python:3.12-alpine
+
+RUN apk add --no-cache \
+    tzdata \
+    bash \
+    docker-cli \
+    docker-cli-compose \
+    jq \
+    curl \
+    openssl \
+    libqrencode-tools
+
+WORKDIR /app
+
+COPY admin/requirements.txt /app/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+COPY admin/ /app/
+COPY scripts/admin-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8443
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["/entrypoint.sh"]

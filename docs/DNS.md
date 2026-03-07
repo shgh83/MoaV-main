@@ -1,0 +1,573 @@
+# DNS Configuration Guide
+
+This guide explains how to configure DNS records for MoaV.
+
+## Table of Contents
+
+- [Do I Need a Domain?](#do-i-need-a-domain)
+- [Domain-less Mode](#domain-less-mode)
+- [Domain Setup](#domain-setup)
+  - [Minimum Setup (Without DNS Tunnels)](#minimum-setup-without-dns-tunnels)
+  - [Full Setup (With DNS Tunnels)](#full-setup-with-dns-tunnels)
+- [Provider-Specific Instructions](#provider-specific-instructions)
+  - [Cloudflare](#cloudflare)
+  - [Namecheap](#namecheap)
+  - [Google Domains / Squarespace](#google-domains--squarespace)
+  - [Hetzner DNS](#hetzner-dns)
+- [Home Servers & Raspberry Pi](#home-servers--raspberry-pi)
+  - [Port Forwarding](#port-forwarding)
+  - [Dynamic DNS (DDNS)](#dynamic-dns-ddns)
+  - [DuckDNS (Free)](#duckdns-free)
+  - [Cloudflare DDNS (Own Domain)](#cloudflare-ddns-own-domain)
+  - [Home Server Tips](#home-server-tips)
+- [Verification](#verification)
+- [Common Issues](#common-issues)
+- [Domain Acquisition Tips](#domain-acquisition-tips)
+
+---
+
+## Do I Need a Domain?
+
+**No.** MoaV can run without a domain in **domain-less mode**. A domain unlocks more protocols, but several work with just an IP address.
+
+| Protocol | Requires Domain | Port |
+|----------|:-:|------|
+| Reality (VLESS) | No | 443/tcp |
+| WireGuard | No | 51820/udp |
+| WireGuard (wstunnel) | No | 8080/tcp |
+| AmneziaWG | No | 51821/udp |
+| Telegram MTProxy (telemt) | No | 993/tcp |
+| Admin Dashboard | No | 9443/tcp |
+| Conduit (Psiphon donation) | No | — |
+| Snowflake (Tor donation) | No | — |
+| Trojan | **Yes** | 8443/tcp |
+| Hysteria2 | **Yes** | 443/udp |
+| TrustTunnel | **Yes** | 4443/tcp+udp |
+| CDN (VLESS+WebSocket) | **Yes** (Cloudflare) | 2082/tcp |
+| dnstt (DNS tunnel) | **Yes** (NS records) | 53/udp |
+| Slipstream (QUIC-over-DNS) | **Yes** (NS records) | 53/udp |
+
+**Domain-dependent protocols** need a valid TLS certificate (via Let's Encrypt) or NS delegation, which both require a domain.
+
+---
+
+## Domain-less Mode
+
+Leave `DOMAIN=` empty in your `.env` file. MoaV automatically detects this and runs only protocols that work without a domain:
+
+- **Reality** — VLESS with TLS camouflage (uses `REALITY_TARGET` like `dl.google.com` instead of your own domain)
+- **WireGuard** — Full VPN, direct UDP or tunneled over WebSocket (TCP) when UDP is blocked
+- **AmneziaWG** — DPI-resistant WireGuard with packet-level obfuscation
+- **Telegram MTProxy** — Direct Telegram access via fake-TLS, no VPN needed
+- **Admin Dashboard** — Web UI with self-signed certificate
+- **Conduit / Snowflake** — Bandwidth donation (optional)
+
+This is ideal for:
+- **Raspberry Pi** or home servers without a registered domain
+- Quick deployments when you can't register a domain
+- Environments where only VPN-style protocols are needed
+
+You can upgrade to a full domain setup later — just set `DOMAIN=` in `.env` and run `moav bootstrap`.
+
+### Port Forwarding (Domain-less)
+
+If running on a home network, forward these ports on your router:
+
+| Port | Protocol | Service |
+|------|----------|---------|
+| 443/tcp | TCP | Reality (VLESS) |
+| 51820/udp | UDP | WireGuard |
+| 8080/tcp | TCP | wstunnel (WireGuard over WebSocket) |
+| 51821/udp | UDP | AmneziaWG |
+| 993/tcp | TCP | Telegram MTProxy |
+| 9443/tcp | TCP | Admin Dashboard |
+
+> No port 80 needed — domain-less mode doesn't use Let's Encrypt.
+
+---
+
+## Domain Setup
+
+If you have a domain, you unlock all 13+ protocols. How many DNS records you need depends on which features you enable.
+
+### Minimum Setup (Without DNS Tunnels)
+
+If you don't need DNS tunnels (dnstt / Slipstream), you only need one record:
+
+```
+Type: A
+Name: @ (or your domain name)
+Value: YOUR_SERVER_IP
+TTL: 300 (or Auto)
+```
+
+This enables: Reality, Trojan, Hysteria2, TrustTunnel, CDN mode, and all domain-less protocols.
+
+### Full Setup (With DNS Tunnels)
+
+#### Step 1: Main A Record
+
+```
+Type: A
+Name: @ (or your domain name)
+Value: YOUR_SERVER_IP
+TTL: 300
+```
+
+#### Step 2: DNS Server A Record
+
+```
+Type: A
+Name: dns
+Value: YOUR_SERVER_IP
+TTL: 300
+```
+
+This creates `dns.yourdomain.com` pointing to your server (used as the nameserver for tunnel subdomains).
+
+#### Step 3: NS Delegation for dnstt
+
+```
+Type: NS
+Name: t
+Value: dns.yourdomain.com
+TTL: 300
+```
+
+This tells DNS resolvers that queries for `*.t.yourdomain.com` should be sent to `dns.yourdomain.com` (your server). Used by dnstt.
+
+#### Step 4: NS Delegation for Slipstream (Optional)
+
+```
+Type: NS
+Name: s
+Value: dns.yourdomain.com
+TTL: 300
+```
+
+Same concept as dnstt, but for the Slipstream QUIC-over-DNS tunnel. Slipstream is 1.5-5x faster than dnstt. Only needed if `ENABLE_SLIPSTREAM=true`.
+
+#### Optional: IPv6 Support
+
+If your server has IPv6, you can also add an AAAA record for the nameserver:
+
+```
+Type: AAAA
+Name: dns
+Value: YOUR_SERVER_IPV6
+TTL: 300
+```
+
+> **More Info**: For detailed dnstt documentation, see the [official dnstt guide](https://www.bamsoftware.com/software/dnstt/).
+
+### Summary of All DNS Records
+
+| Record | Name | Value | Proxy | Purpose | Required? |
+|--------|------|-------|-------|---------|-----------|
+| A | `@` | Server IP | DNS only | Main domain (Trojan, Hysteria2, Reality) | Yes |
+| A | `dns` | Server IP | DNS only | Nameserver for DNS tunnels | Only for dnstt/Slipstream |
+| NS | `t` | `dns.domain.com` | — | dnstt tunnel subdomain | Only for dnstt |
+| NS | `s` | `dns.domain.com` | — | Slipstream tunnel subdomain | Only for Slipstream |
+| A | `cdn` | Server IP | **Proxied** | CDN-fronted VLESS | Only for CDN mode |
+| A | `www` | Server IP | **Proxied** | CDN stealth connect address | Optional (CDN stealth) |
+| A | `grafana` | Server IP | **Proxied** | Grafana via CDN | Optional (monitoring) |
+
+---
+
+## Provider-Specific Instructions
+
+### Cloudflare
+
+1. Log into Cloudflare Dashboard
+2. Select your domain
+3. Go to DNS → Records
+4. Add records:
+
+**Important:** Set proxy status to "DNS only" (gray cloud) for most records. Only CDN-related records should be "Proxied" (orange cloud).
+
+| Type | Name | Content | Proxy status |
+|------|------|---------|--------------|
+| A | @ | YOUR_IP | DNS only |
+| A | dns | YOUR_IP | DNS only |
+| NS | t | dns.yourdomain.com | — |
+| NS | s | dns.yourdomain.com | — |
+| A | cdn | YOUR_IP | **Proxied** (orange cloud) |
+| A | www | YOUR_IP | **Proxied** (orange cloud) |
+| A | grafana | YOUR_IP | **Proxied** (orange cloud) |
+
+> The `cdn`, `www`, and `grafana` records are optional:
+> - `cdn` — Required if you want CDN-fronted VLESS (`ENABLE_CDN=true` or CDN_SUBDOMAIN set)
+> - `www` — Recommended for CDN stealth. Used as the CDN connect address so DNS queries don't reveal the "cdn" subdomain to DPI. Set `CDN_ADDRESS=www.yourdomain.com` in `.env`
+> - `grafana` — Only needed if you want faster Grafana loading via CDN (see [Monitoring Guide](MONITORING.md#cloudflare-cdn-for-faster-grafana-recommended))
+>
+> All other records **must** be DNS only (gray cloud).
+
+#### CDN Origin Rule (Required for CDN Mode)
+
+If you added the `cdn` record above, you **must** also create an Origin Rule to redirect traffic to port 2082. By default, Cloudflare's Flexible SSL connects to origin port 80, but MoaV's CDN listener runs on port 2082.
+
+**Step 1: Go to Rules → Origin Rules**
+
+1. In Cloudflare Dashboard, select your domain
+2. Navigate to **Rules** → **Origin Rules**
+3. Click **Create rule**
+
+**Step 2: Configure the Rule**
+
+| Field | Value |
+|-------|-------|
+| Rule name | `CDN to port 2082` |
+| When incoming requests match... | **Hostname** equals `cdn.yourdomain.com` |
+| Then... | **Destination Port** → Rewrite to `2082` |
+
+**Step 3: Deploy**
+
+Click **Deploy** to activate the rule.
+
+**Verify it works:**
+```bash
+# Should return HTTP 400 (sing-box responding, not Cloudflare 521)
+# Use any path - the CDN WS path is auto-generated during bootstrap
+curl -s -o /dev/null -w "%{http_code}" https://cdn.yourdomain.com/test
+```
+
+A `400` or `404` response means sing-box is receiving the request.
+- `521` = Origin Rule is missing or misconfigured
+- `525` = SSL mode is wrong — set Cloudflare SSL/TLS to **Flexible** (not Full/Strict), because MoaV's CDN port 2082 is plain HTTP
+
+> **Important:** Cloudflare SSL/TLS mode must be set to **Flexible** for CDN mode. MoaV's CDN inbound on port 2082 is plain HTTP (Cloudflare terminates TLS). If you need Full SSL for other subdomains, use a Configuration Rule to set Flexible for just `cdn.yourdomain.com`.
+
+See [CDN Setup Guide](SETUP.md#cdn-fronted-vlesswebsocket-cloudflare) for complete CDN configuration.
+
+### Namecheap
+
+1. Log into Namecheap
+2. Domain List → Manage → Advanced DNS
+3. Add records:
+
+| Type | Host | Value | TTL |
+|------|------|-------|-----|
+| A Record | @ | YOUR_IP | Automatic |
+| A Record | dns | YOUR_IP | Automatic |
+| NS Record | t | dns.yourdomain.com. | Automatic |
+| NS Record | s | dns.yourdomain.com. | Automatic |
+
+Note: NS value may need trailing dot. The `dns`, `t`, and `s` records are only needed if using DNS tunnels.
+
+### Google Domains / Squarespace
+
+1. Go to DNS settings
+2. Add custom records:
+
+| Host name | Type | TTL | Data |
+|-----------|------|-----|------|
+| (blank) | A | 300 | YOUR_IP |
+| dns | A | 300 | YOUR_IP |
+| t | NS | 300 | dns.yourdomain.com |
+| s | NS | 300 | dns.yourdomain.com |
+
+### Hetzner DNS
+
+1. Go to DNS Console
+2. Select your zone
+3. Add records:
+
+```
+@ IN A YOUR_IP
+dns IN A YOUR_IP
+t IN NS dns.yourdomain.com.
+s IN NS dns.yourdomain.com.
+```
+
+---
+
+## Home Servers & Raspberry Pi
+
+MoaV runs on Raspberry Pi 4+ (2GB+ RAM) and any ARM64/x64 Linux machine. Home servers typically have dynamic IPs and sit behind a router, so you need port forwarding and (if using a domain) Dynamic DNS.
+
+### Port Forwarding
+
+Configure your router to forward the ports you need to your MoaV server's local IP.
+
+**Domain-less mode** (minimum):
+
+| Port | Protocol | Service |
+|------|----------|---------|
+| 443/tcp | TCP | Reality (VLESS) |
+| 51820/udp | UDP | WireGuard |
+| 8080/tcp | TCP | wstunnel (WireGuard over WebSocket) |
+| 51821/udp | UDP | AmneziaWG |
+| 993/tcp | TCP | Telegram MTProxy |
+| 9443/tcp | TCP | Admin Dashboard |
+
+**With domain** (add these):
+
+| Port | Protocol | Service |
+|------|----------|---------|
+| 80/tcp | TCP | Let's Encrypt verification (only during certificate setup/renewal) |
+| 443/udp | UDP | Hysteria2 |
+| 8443/tcp | TCP | Trojan |
+| 4443/tcp | TCP | TrustTunnel (HTTP/2) |
+| 4443/udp | UDP | TrustTunnel (HTTP/3 / QUIC) |
+| 53/udp | UDP | DNS tunnels (dnstt + Slipstream) |
+
+**Optional**:
+
+| Port | Protocol | Service |
+|------|----------|---------|
+| 9444/tcp | TCP | Grafana monitoring dashboard |
+
+> Only forward ports for protocols you actually enable. Check your `.env` file for `ENABLE_*` toggles.
+
+### Before You Start
+
+1. **Check for CGNAT**: Some ISPs use Carrier-Grade NAT which prevents incoming connections entirely. Test by comparing your router's WAN IP with `curl ipinfo.io/ip`. If they differ, contact your ISP for a public IP or use a VPS instead.
+
+2. **Static local IP**: Assign a static IP to your MoaV server in your router's DHCP settings so port forwarding rules don't break when the local IP changes.
+
+### Dynamic DNS (DDNS)
+
+If you're using a domain with a home server, your ISP likely assigns a dynamic public IP that changes periodically. Dynamic DNS services automatically update your domain to point to your current IP.
+
+> **Domain-less mode does not need DDNS.** Users connect via your public IP directly. You can find your current public IP with `curl ifconfig.me` and share it manually. If your IP changes, update the configs you shared.
+
+### DuckDNS (Free)
+
+DuckDNS is a free DDNS service that provides subdomains like `yourname.duckdns.org`. Let's Encrypt works with DuckDNS domains.
+
+#### Step 1: Create Account
+
+1. Go to [duckdns.org](https://www.duckdns.org/)
+2. Sign in with Google, GitHub, Twitter, or Reddit
+3. Create a subdomain (e.g., `myvpn` → `myvpn.duckdns.org`)
+4. Copy your **token** from the dashboard
+
+#### Step 2: Install Update Script
+
+On your MoaV server (Raspberry Pi or home server):
+
+```bash
+# Create update script
+mkdir -p /opt/duckdns
+cat > /opt/duckdns/duck.sh << 'EOF'
+#!/bin/bash
+DOMAIN="YOUR_SUBDOMAIN"  # e.g., myvpn (without .duckdns.org)
+TOKEN="YOUR_TOKEN"
+
+curl -s "https://www.duckdns.org/update?domains=${DOMAIN}&token=${TOKEN}&ip=" | logger -t duckdns
+EOF
+
+# Replace with your values
+nano /opt/duckdns/duck.sh
+
+# Make executable
+chmod +x /opt/duckdns/duck.sh
+
+# Test it
+/opt/duckdns/duck.sh
+```
+
+#### Step 3: Schedule Automatic Updates
+
+```bash
+# Add to crontab (runs every 5 minutes)
+(crontab -l 2>/dev/null; echo "*/5 * * * * /opt/duckdns/duck.sh") | crontab -
+```
+
+#### Step 4: Configure MoaV
+
+In your `.env` file:
+```bash
+DOMAIN=yourname.duckdns.org
+```
+
+Then run bootstrap as normal.
+
+> **Note:** DuckDNS subdomains don't support NS delegation, so DNS tunnels (dnstt, Slipstream) won't work with DuckDNS. All other domain-based protocols work fine.
+
+### Cloudflare DDNS (Own Domain)
+
+If you have your own domain on Cloudflare, you can use the Cloudflare API to update DNS records automatically. This supports all features including DNS tunnels.
+
+#### Step 1: Get API Token
+
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) → My Profile → API Tokens
+2. Create a token with **Zone:DNS:Edit** permission for your domain
+3. Copy the token
+
+#### Step 2: Get Zone ID
+
+1. Go to your domain in Cloudflare
+2. Scroll down on the Overview page
+3. Copy the **Zone ID** from the right sidebar
+
+#### Step 3: Install Update Script
+
+```bash
+mkdir -p /opt/cloudflare-ddns
+cat > /opt/cloudflare-ddns/update.sh << 'EOF'
+#!/bin/bash
+
+# Configuration
+CF_API_TOKEN="YOUR_API_TOKEN"
+CF_ZONE_ID="YOUR_ZONE_ID"
+DOMAIN="yourdomain.com"
+RECORD_NAME="@"  # Use "@" for root domain or "subdomain" for subdomain
+
+# Get current public IP
+CURRENT_IP=$(curl -s https://api.ipify.org)
+
+# Get current DNS record
+RECORD_DATA=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${DOMAIN}" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+    -H "Content-Type: application/json")
+
+RECORD_ID=$(echo "$RECORD_DATA" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+RECORD_IP=$(echo "$RECORD_DATA" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+# Update if IP changed
+if [ "$CURRENT_IP" != "$RECORD_IP" ]; then
+    echo "IP changed from $RECORD_IP to $CURRENT_IP, updating..."
+    curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"${DOMAIN}\",\"content\":\"${CURRENT_IP}\",\"ttl\":300,\"proxied\":false}" | logger -t cloudflare-ddns
+else
+    echo "IP unchanged ($CURRENT_IP)"
+fi
+EOF
+
+# Edit with your values
+nano /opt/cloudflare-ddns/update.sh
+
+chmod +x /opt/cloudflare-ddns/update.sh
+```
+
+#### Step 4: Schedule Updates
+
+```bash
+# Run every 5 minutes
+(crontab -l 2>/dev/null; echo "*/5 * * * * /opt/cloudflare-ddns/update.sh") | crontab -
+```
+
+#### Step 5: Configure MoaV
+
+In your `.env`:
+```bash
+DOMAIN=yourdomain.com
+```
+
+### After DDNS Setup
+
+1. **Wait for propagation**: After the first update, wait 5-10 minutes
+2. **Verify**: `dig +short yourdomain.com` should show your home IP
+3. **Run MoaV setup**: `moav` to start the interactive setup
+4. **Test from outside**: Use mobile data (not home WiFi) to test connectivity
+
+### Home Server Tips
+
+- **UPS recommended**: Protect against power outages, especially for Raspberry Pi
+- **Monitor uptime**: Use a free service like [UptimeRobot](https://uptimerobot.com/) to alert you if your server goes down
+- **Backup regularly**: `moav export` to backup your configuration
+- **Temperature**: Ensure adequate cooling for Raspberry Pi under sustained VPN load
+- **SD card**: Use a high-endurance microSD card or boot from USB/SSD for reliability
+
+---
+
+## Verification
+
+After configuring DNS, wait for propagation (usually 5-30 minutes, up to 48 hours).
+
+### Verify A Record
+
+```bash
+dig +short yourdomain.com
+# Should return: YOUR_SERVER_IP
+
+dig +short dns.yourdomain.com
+# Should return: YOUR_SERVER_IP
+```
+
+### Verify NS Delegation
+
+```bash
+dig NS t.yourdomain.com
+# Should show: dns.yourdomain.com in AUTHORITY SECTION
+
+# Test that queries reach your server
+dig @YOUR_SERVER_IP test.t.yourdomain.com
+# Should get a response (after dnstt is running)
+```
+
+### Online Tools
+
+- https://dnschecker.org - Check propagation worldwide
+- https://mxtoolbox.com/DNSLookup.aspx - Detailed DNS lookup
+
+## Common Issues
+
+### "DNS not propagated yet"
+
+Wait longer (up to 48 hours in rare cases). Check with multiple DNS servers:
+
+```bash
+dig @8.8.8.8 yourdomain.com
+dig @1.1.1.1 yourdomain.com
+```
+
+### "NS record not working"
+
+- Ensure the A record for `dns.yourdomain.com` exists
+- Some registrars require a trailing dot: `dns.yourdomain.com.`
+- NS delegation can take longer to propagate
+
+### "Certificate acquisition failed"
+
+- Verify A record is correct: `dig yourdomain.com`
+- Ensure port 80 is open (temporarily, for ACME HTTP-01)
+- Check that no other service is using port 80
+- Not applicable in domain-less mode (no certificates needed)
+
+### "Can't connect from outside my home network"
+
+- Verify port forwarding is configured on your router
+- Check for CGNAT: `curl ifconfig.me` should match your router's WAN IP
+- Ensure your ISP doesn't block the ports you need
+- Test from mobile data, not your home WiFi
+
+---
+
+## Domain Acquisition Tips
+
+For users in censored regions:
+
+1. **Use privacy protection** - Hide your personal info in WHOIS
+2. **Pay with crypto** if possible - For anonymity
+3. **Choose a neutral TLD** - `.com`, `.net`, `.org` are less suspicious than country-specific TLDs
+4. **Avoid "VPN" or "proxy" in the domain name** - Keep it generic
+5. **Consider multiple domains** - Have backups ready if one gets blocked
+
+### Domain Naming Strategy
+
+Your domain name is the first thing DPI systems see in the TLS SNI. A good domain blends with legitimate traffic:
+
+**Good examples:**
+- Names that look like business infrastructure: `cloudops-services.com`, `cdn-platform.net`
+- Names that look like SaaS products: `dataflow-sync.com`, `metrics-hub.net`
+- Generic tech names: `stackbuilder.io`, `nodebridge.net`
+
+**Bad examples:**
+- Anything with "vpn", "proxy", "tunnel", "free", "bypass" in the name
+- Random strings: `xk4m2p.com` (suspicious to automated systems)
+- Known circumvention patterns: `v2ray-server.com`
+
+**Subdomain naming** also matters. MoaV's CDN subdomain defaults to `cdn` — consider changing it to something like `assets`, `static`, `api`, or `app` in your `.env`:
+```bash
+CDN_SUBDOMAIN=assets
+```
+
+### Recommended Registrars
+
+- Namecheap - Good privacy, accepts crypto
+- Porkbun - Cheap, good privacy
+- Njalla - Maximum privacy (they own the domain for you)

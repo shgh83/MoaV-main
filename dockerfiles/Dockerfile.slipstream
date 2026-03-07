@@ -1,0 +1,45 @@
+# =============================================================================
+# MoaV Slipstream - QUIC-over-DNS tunnel server
+# =============================================================================
+# Slipstream provides faster DNS tunneling than dnstt (1.5-5x speedup).
+# Uses pre-built Rust binaries from net2share/slipstream-rust-build.
+# Uses debian:bookworm-slim (glibc) — the Rust binaries are dynamically linked.
+# =============================================================================
+
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+
+# Version - read from .env via docker-compose build args, with fallback default
+ARG SLIPSTREAM_VERSION=2026.02.22.1
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    curl \
+    ca-certificates \
+    openssl \
+    wget \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Architecture mapping and binary download
+# slipstream-rust-build uses: linux-amd64, linux-arm64
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    echo "Downloading slipstream-server v${SLIPSTREAM_VERSION} for ${ARCH}..." && \
+    wget -qO /usr/local/bin/slipstream-server \
+    "https://github.com/net2share/slipstream-rust-build/releases/download/v${SLIPSTREAM_VERSION}/slipstream-server-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/slipstream-server && \
+    echo "slipstream-server v${SLIPSTREAM_VERSION} installed (${ARCH})" || \
+    { echo "slipstream-server: download failed"; exit 1; }
+
+# Create directories
+RUN mkdir -p /app /state/keys /etc/slipstream
+
+# Copy entrypoint
+COPY scripts/slipstream-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 5354/udp
+
+ENTRYPOINT ["/app/entrypoint.sh"]

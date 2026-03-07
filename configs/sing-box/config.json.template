@@ -1,0 +1,184 @@
+{
+  "log": {
+    "level": "${LOG_LEVEL}",
+    "timestamp": false
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "0.0.0.0:9090",
+      "secret": "${CLASH_API_SECRET}"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "/state/sing-box-cache.db"
+    }
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1080,
+      "sniff": true
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "tcp_fast_open": true,
+      "sniff": true,
+      "users": ${REALITY_USERS_JSON},
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SERVER_NAME}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${REALITY_TARGET_HOST}",
+            "server_port": ${REALITY_TARGET_PORT}
+          },
+          "private_key": "${REALITY_PRIVATE_KEY}",
+          "short_id": ["${REALITY_SHORT_ID}"]
+        }
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": true
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "tcp_fast_open": true,
+      "sniff": true,
+      "users": ${TROJAN_USERS_JSON},
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "certificate_path": "/certs/live/${DOMAIN}/fullchain.pem",
+        "key_path": "/certs/live/${DOMAIN}/privkey.pem"
+      },
+      "fallback": {
+        "server": "decoy",
+        "server_port": 80
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": true
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-in",
+      "listen": "::",
+      "listen_port": 443,
+      "sniff": true,
+      "users": ${HYSTERIA2_USERS_JSON},
+      "obfs": {
+        "type": "salamander",
+        "password": "${HYSTERIA2_OBFS_PASSWORD}"
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "alpn": ["h3"],
+        "certificate_path": "/certs/live/${DOMAIN}/fullchain.pem",
+        "key_path": "/certs/live/${DOMAIN}/privkey.pem"
+      },
+      "masquerade": "http://decoy:80"
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-in",
+      "listen": "::",
+      "listen_port": 2082,
+      "sniff": true,
+      "users": ${VLESS_WS_USERS_JSON},
+      "transport": {
+        "type": "${CDN_TRANSPORT}",
+        "path": "${CDN_WS_PATH}"
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": true
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "::",
+      "listen_port": ${SS_PORT:-8388},
+      "sniff": true,
+      "method": "2022-blake3-aes-256-gcm",
+      "password": "${SS_PASSWORD}",
+      "multiplex": {
+        "enabled": true,
+        "padding": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "hijack-dns",
+        "protocol": "dns"
+      },
+      {
+        "action": "route",
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "direct",
+    "default_domain_resolver": "local-dns"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "local-dns",
+        "type": "local"
+      },
+      {
+        "tag": "google-dns",
+        "type": "udp",
+        "server": "8.8.8.8"
+      },
+      {
+        "tag": "cloudflare-dns",
+        "type": "udp",
+        "server": "1.1.1.1"
+      },
+      {
+        "tag": "quad9-dns",
+        "type": "udp",
+        "server": "9.9.9.9"
+      },
+      {
+        "tag": "google-doh",
+        "type": "https",
+        "server": "8.8.8.8",
+        "server_port": 443
+      },
+      {
+        "tag": "cloudflare-doh",
+        "type": "https",
+        "server": "1.1.1.1",
+        "server_port": 443
+      }
+    ],
+    "final": "google-dns"
+  }
+}

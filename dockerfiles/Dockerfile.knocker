@@ -1,0 +1,34 @@
+# =============================================================================
+# MoaV Knocker — HMAC-based connection admission proxy (GFK-style DPI evasion)
+#
+# Server: Sits in front of sing-box port 443, admits connections that carry a
+#         valid time-window HMAC token, deflects probe traffic to the decoy.
+# Client: Prepends tokens, runs as a local transparent SOCKS5 passthrough.
+# =============================================================================
+
+FROM golang:1.21-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /src
+COPY knocker/ .
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /knocker .
+
+# ── Runtime image ─────────────────────────────────────────────────────────────
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata bash
+
+COPY --from=builder /knocker /usr/local/bin/knocker
+
+RUN mkdir -p /state/keys /etc/knocker
+
+EXPOSE 8444/tcp
+
+COPY scripts/knocker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,101 @@
+# Environment files with secrets
+.env
+*.env.local
+
+# Generated outputs (contain user credentials)
+outputs/
+!outputs/.gitkeep
+
+# State and certificates
+state/
+certs/
+.moav_prereqs_ok
+
+# Logs
+*.log
+logs/
+
+# Docker volumes (if extracted)
+moav_*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+venv/
+.venv/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Backup files
+*.tar.gz
+*.backup
+backup/
+
+# Generated configs (keep templates)
+configs/sing-box/config.json
+configs/dnstt/server.conf
+configs/dnstt/server.pub
+configs/dnstt/*.key
+configs/dnstt/*.key.hex
+
+# WireGuard generated files
+configs/wireguard/wg0.conf
+configs/wireguard/wg0.conf.*
+configs/wireguard/server.pub
+configs/wireguard/server.key
+configs/wireguard/wg_confs/
+configs/wireguard/coredns/
+configs/wireguard/templates/
+configs/wireguard/peer*/
+
+# AmneziaWG generated files
+configs/amneziawg/awg0.conf
+configs/amneziawg/server.pub
+
+# TrustTunnel generated files (keep .template files)
+configs/trusttunnel/vpn.toml
+configs/trusttunnel/hosts.toml
+configs/trusttunnel/credentials.toml
+
+# Slipstream generated files
+configs/slipstream/cert.pem
+configs/slipstream/key.pem
+
+# Telegram MTProxy (telemt) generated files
+configs/telemt/config.toml
+
+# DNS router
+configs/dns-router/
+
+# Generic patterns for generated secrets
+*.key
+*.key.hex
+*.priv
+*.private
+*.secret
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+spec.yaml
+.claude/settings.local.json
+*.mp4

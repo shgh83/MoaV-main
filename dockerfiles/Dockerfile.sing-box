@@ -1,0 +1,29 @@
+# sing-box multi-protocol proxy server
+# Using pre-built binary for faster deployment
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG SINGBOX_VERSION=1.12.23
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Download pre-built binary
+RUN curl -L -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${TARGETARCH}.tar.gz" && \
+    tar -xzf sing-box.tar.gz && \
+    mv sing-box-${SINGBOX_VERSION}-linux-${TARGETARCH}/sing-box /usr/local/bin/sing-box && \
+    chmod +x /usr/local/bin/sing-box && \
+    rm -rf sing-box.tar.gz sing-box-${SINGBOX_VERSION}-linux-${TARGETARCH}
+
+RUN mkdir -p /etc/sing-box /var/log/sing-box /state
+
+COPY scripts/sing-box-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 443/tcp 443/udp 8443/tcp 2082/tcp
+
+ENTRYPOINT ["/entrypoint.sh"]

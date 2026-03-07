@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""
+MoaV Admin Dashboard
+Simple stats viewer for the circumvention stack
+"""
+
+import os
+import json
+import asyncio
+import socket
+import zipfile
+import io
+import re
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.templating import Jinja2Templates
+import secrets
+
+app = FastAPI(title="MoaV Admin", docs_url=None, redoc_url=None)
+security = HTTPBasic()
+templates = Jinja2Templates(directory="templates")
+
+# Configuration
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+ADMIN_IP_WHITELIST = os.environ.get("ADMIN_IP_WHITELIST", "").split(",")
+ADMIN_IP_WHITELIST = [ip.strip() for ip in ADMIN_IP_WHITELIST if ip.strip()]
+
+SINGBOX_API = "http://moav-sing-box:9090"
+CLASH_SECRET = ""
+
+# Try to load Clash API secret
+try:
+    with open("/state/keys/clash-api.env") as f:
+        for line in f:
+            if line.startswith("CLASH_API_SECRET="):
+                CLASH_SECRET = line.split("=", 1)[1].strip()
+except FileNotFoundError:
+    pass
+
+# Current version
+CURRENT_VERSION = "unknown"
+for _vpath in ["/project/VERSION", "/app/VERSION"]:
+    try:
+        with open(_vpath) as f:
+            CURRENT_VERSION = f.read().strip()
+            break
+    except FileNotFoundError:
+        continue
+
+# Update check cache
+UPDATE_CACHE = {"version": None, "checked_at": 0}
+UPDATE_CACHE_TTL = 3600  # 1 hour
+
+
+def version_gt(v1: str, v2: str) -> bool:
+    """Check if v1 > v2 (semver comparison)"""
+    try:
+        v1_parts = [int(x) for x in v1.split(".")[:3]]
+        v2_parts = [int(x) for x in v2.split(".")[:3]]
+        return v1_parts > v2_parts
+    except (ValueError, AttributeError):
+        return False
+
+
+async def check_for_updates() -> dict:
+    """Check GitHub for latest release (cached for 1 hour)"""
+    now = time.time()
+
+    # Return cached result if still valid
+    if UPDATE_CACHE["version"] and (now - UPDATE_CACHE["checked_at"]) < UPDATE_CACHE_TTL:
+        latest = UPDATE_CACHE["version"]
+        return {
+            "update_available": version_gt(latest, CURRENT_VERSION),
+            "latest_version": latest,
+            "current_version": CURRENT_VERSION,
+        }
+
+    # Fetch from GitHub API
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                "https://api.github.com/repos/shayanb/MoaV/releases/latest"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                latest = data.get("tag_name", "").lstrip("v")
+                if latest:
+                    UPDATE_CACHE["version"] = latest
+                    UPDATE_CACHE["checked_at"] = now
+                    return {
+                        "update_available": version_gt(latest, CURRENT_VERSION),
+                        "latest_version": latest,
+                        "current_version": CURRENT_VERSION,
+                    }
+    except Exception:
+        pass
+
+    return {
+        "update_available": False,
+        "latest_version": None,
+        "current_version": CURRENT_VERSION,
+    }
+
+
+def verify_auth(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify authentication via password and optional IP whitelist"""
+    client_ip = request.client.host
+
+    # Check IP whitelist if configured
+    if ADMIN_IP_WHITELIST:
+        ip_allowed = any(
+            client_ip.startswith(allowed.rstrip("0123456789").rstrip("."))
+            if "/" in allowed else client_ip == allowed
+            for allowed in ADMIN_IP_WHITELIST
+        )
+        if not ip_allowed:
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
+    # Check password
+    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not correct_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+def check_service_status(name: str) -> str:
+    """Check if a Docker service is running by trying DNS resolution"""
+    service_hosts = {
+        "sing-box": "moav-sing-box",
+        "decoy": "moav-decoy",
+        "wstunnel": "moav-wstunnel",
+        "wireguard": "moav-wireguard",
+        "dnstt": "moav-dnstt",
+        "slipstream": "moav-slipstream",
+        "conduit": "moav-conduit",
+        "trusttunnel": "moav-trusttunnel",
+        "telemt": "moav-telemt",
+        "amneziawg": "moav-amneziawg",
+        "grafana": "moav-grafana",
+    }
+
+    # Snowflake uses host networking, can't detect from inside container
+    if name == "snowflake":
+        return "unknown"
+
+    if name not in service_hosts:
+        return "unknown"
+
+    host = service_hosts[name]
+    try:
+        # Try DNS resolution with a local timeout (not global)
+        # Create a socket just for the DNS check
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(0.5)
+        try:
+            socket.gethostbyname(host)
+            return "running"
+        finally:
+            # Restore original timeout
+            socket.setdefaulttimeout(old_timeout)
+    except socket.gaierror:
+        return "stopped"
+    except socket.timeout:
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+async def fetch_singbox_stats():
+    """Fetch stats from sing-box Clash API"""
+    stats = {
+        "connections": [],
+        "traffic": {"upload": 0, "download": 0},
+        "memory": 0,
+        "error": None
+    }
+
+    headers = {}
+    if CLASH_SECRET:
+        headers["Authorization"] = f"Bearer {CLASH_SECRET}"
+
+    # Use explicit timeout config to prevent hanging
+    timeout = httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0)
+
+    try:
+        # Wrap entire operation in asyncio timeout as backup
+        async with asyncio.timeout(10.0):
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    # Get connections (includes upload/download per connection)
+                    resp = await client.get(f"{SINGBOX_API}/connections", headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        stats["connections"] = data.get("connections", []) or []
+                        stats["traffic"]["upload"] = data.get("uploadTotal", 0)
+                        stats["traffic"]["download"] = data.get("downloadTotal", 0)
+
+                    # Get memory - this is a streaming endpoint, read first line only
+                    async with client.stream("GET", f"{SINGBOX_API}/memory", headers=headers) as resp:
+                        if resp.status_code == 200:
+                            async for line in resp.aiter_lines():
+                                if line.strip():
+                                    try:
+                                        data = json.loads(line)
+                                        stats["memory"] = data.get("inuse", 0)
+                                    except json.JSONDecodeError:
+                                        pass
+                                    break  # Only need first line
+
+                except httpx.ConnectError:
+                    stats["error"] = "sing-box API not reachable"
+                except httpx.ConnectTimeout:
+                    stats["error"] = "sing-box connection timeout"
+                except httpx.ReadTimeout:
+                    stats["error"] = "sing-box read timeout"
+                except httpx.TimeoutException:
+                    stats["error"] = "sing-box API timeout"
+
+    except asyncio.TimeoutError:
+        stats["error"] = "sing-box API timeout (10s)"
+    except Exception as e:
+        stats["error"] = f"Error: {type(e).__name__}: {str(e)}"
+
+    return stats
+
+
+def _parse_prometheus_metric(lines: list[str], metric_name: str) -> float:
+    """Extract a simple gauge/counter value from Prometheus text format."""
+    for line in lines:
+        if line.startswith(metric_name + " ") or line.startswith(metric_name + "{"):
+            # Simple metric without labels: "metric_name value"
+            if line.startswith(metric_name + " "):
+                try:
+                    return float(line.split()[-1])
+                except (ValueError, IndexError):
+                    pass
+    return 0
+
+
+def _parse_prometheus_labeled(lines: list[str], metric_name: str) -> list[dict]:
+    """Extract labeled metrics (e.g. per-region) from Prometheus text format."""
+    results = []
+    for line in lines:
+        if line.startswith(metric_name + "{"):
+            try:
+                # Parse: metric_name{label="value",...} number
+                labels_str = line[line.index("{") + 1:line.index("}")]
+                value = float(line.split()[-1])
+                labels = {}
+                for part in labels_str.split(","):
+                    k, v = part.split("=", 1)
+                    labels[k.strip()] = v.strip().strip('"')
+                results.append({"labels": labels, "value": value})
+            except (ValueError, IndexError):
+                pass
+    return results
+
+
+async def fetch_conduit_stats():
+    """Fetch stats from Psiphon Conduit v2 native metrics endpoint"""
+    stats = {
+        "running": False,
+        "connections": {"connecting": 0, "connected": 0},
+        "bandwidth": {"upload": "0 B", "download": "0 B"},
+        "regions": [],
+        "ryve_link": None,
+        "error": None
+    }
+
+    # Read Ryve pairing link from persisted file (written by conduit-entrypoint.sh)
+    ryve_path = Path("/conduit-data/ryve-link.txt")
+    if ryve_path.exists():
+        try:
+            stats["ryve_link"] = ryve_path.read_text().strip()
+        except Exception:
+            pass
+
+    # Check if conduit is running
+    if check_service_status("conduit") != "running":
+        stats["error"] = "Conduit not running"
+        return stats
+
+    stats["running"] = True
+
+    # Query native Prometheus metrics endpoint
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("http://psiphon-conduit:9090/metrics")
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+
+        stats["connections"]["connecting"] = int(_parse_prometheus_metric(lines, "conduit_connecting_clients"))
+        stats["connections"]["connected"] = int(_parse_prometheus_metric(lines, "conduit_connected_clients"))
+
+        upload_bytes = _parse_prometheus_metric(lines, "conduit_bytes_uploaded")
+        download_bytes = _parse_prometheus_metric(lines, "conduit_bytes_downloaded")
+        stats["bandwidth"]["upload"] = format_bytes(upload_bytes)
+        stats["bandwidth"]["download"] = format_bytes(download_bytes)
+
+        # Per-region connected clients
+        region_clients = _parse_prometheus_labeled(lines, "conduit_region_connected_clients")
+        region_download = {r["labels"].get("region", ""): r["value"]
+                          for r in _parse_prometheus_labeled(lines, "conduit_region_bytes_downloaded")}
+        region_upload = {r["labels"].get("region", ""): r["value"]
+                        for r in _parse_prometheus_labeled(lines, "conduit_region_bytes_uploaded")}
+
+        for r in region_clients:
+            region = r["labels"].get("region", "Unknown")
+            stats["regions"].append({
+                "region": region,
+                "connected": int(r["value"]),
+                "download": format_bytes(region_download.get(region, 0)),
+                "upload": format_bytes(region_upload.get(region, 0)),
+            })
+        stats["regions"].sort(key=lambda x: x["connected"], reverse=True)
+
+    except Exception as e:
+        stats["error"] = f"Failed to fetch metrics: {e}"
+
+    return stats
+
+
+def format_bytes(bytes_val):
+    """Format bytes to human readable"""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_val < 1024:
+            return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.2f} PB"
+
+
+def get_services_status():
+    """Get status of all services with live checks"""
+    all_services = [
+        {"name": "sing-box", "ports": "443, 8443", "profile": "proxy"},
+        {"name": "decoy", "ports": "—", "profile": "proxy"},
+        {"name": "wstunnel", "ports": "8080", "profile": "wireguard"},
+        {"name": "dnstt", "ports": "53/udp", "profile": "dnstunnel"},
+        {"name": "slipstream", "ports": "—", "profile": "dnstunnel"},
+        {"name": "trusttunnel", "ports": "4443", "profile": "trusttunnel"},
+        {"name": "telemt", "ports": "993", "profile": "telegram"},
+        {"name": "amneziawg", "ports": "51820/udp", "profile": "amneziawg"},
+        {"name": "conduit", "ports": "dynamic", "profile": "conduit"},
+        {"name": "snowflake", "ports": "dynamic", "profile": "snowflake"},
+        {"name": "grafana", "ports": "9444", "profile": "monitoring"},
+    ]
+    for svc in all_services:
+        svc["status"] = check_service_status(svc["name"])
+    # Only return services that are running or were expected (not all stopped)
+    return all_services
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request, username: str = Depends(verify_auth)):
+    """Main dashboard page"""
+    stats = await fetch_singbox_stats()
+    conduit_stats = await fetch_conduit_stats()
+    services = get_services_status()
+    update_info = await check_for_updates()
+
+    # Get all users with their bundle info (no active status tracking)
+    all_users = list_users()
+
+    # Show all services (running and stopped)
+    active_services = services
+
+    # Detect domainless mode (no Let's Encrypt certs = domainless)
+    import glob
+    has_letsencrypt = any(
+        Path(f"{d}fullchain.pem").exists()
+        for d in glob.glob("/certs/live/*/")
+    )
+
+    return templates.TemplateResponse("dashboard.html", {
+        "request": request,
+        "stats": stats,
+        "conduit_stats": conduit_stats,
+        "services": active_services,
+        "all_users": all_users,
+        "format_bytes": format_bytes,
+        "active_connections": len(stats.get("connections", [])),
+        "total_upload": format_bytes(stats["traffic"]["upload"]),
+        "total_download": format_bytes(stats["traffic"]["download"]),
+        "memory_usage": format_bytes(stats.get("memory", 0)),
+        "domainless": not has_letsencrypt,
+        "error": stats.get("error"),
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "update_available": update_info["update_available"],
+        "latest_version": update_info["latest_version"],
+        "current_version": update_info["current_version"],
+    })
+
+
+@app.get("/api/stats")
+async def api_stats(username: str = Depends(verify_auth)):
+    """JSON API for stats"""
+    stats = await fetch_singbox_stats()
+    conduit_stats = await fetch_conduit_stats()
+    services = get_services_status()
+    return {
+        "singbox": stats,
+        "conduit": conduit_stats,
+        "services": services
+    }
+
+
+@app.get("/api/health")
+async def health():
+    """Health check endpoint (no auth required)"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Serve favicon"""
+    for p in ["/project/site/assets/favicon.ico", "/app/site/assets/favicon.ico"]:
+        if Path(p).exists():
+            return FileResponse(p, media_type="image/x-icon")
+    raise HTTPException(status_code=404)
+
+
+@app.get("/logo.png", include_in_schema=False)
+async def logo():
+    """Serve logo"""
+    for p in ["/project/site/assets/favicon.png", "/app/site/assets/favicon.png"]:
+        if Path(p).exists():
+            return FileResponse(p, media_type="image/png")
+    raise HTTPException(status_code=404)
+
+
+# -------------------------------------------------------------------------
+# User Management API
+# -------------------------------------------------------------------------
+PROJECT_DIR = Path("/project")
+USER_ADD_SCRIPT = PROJECT_DIR / "scripts" / "user-add.sh"
+
+
+@app.post("/api/users")
+async def create_user(request: Request, _: str = Depends(verify_auth)):
+    """Create user(s) by calling user-add.sh."""
+    body = await request.json()
+    name = body.get("username", "").strip()
+    batch = int(body.get("batch", 0))
+
+    # Validate inputs
+    if not name:
+        raise HTTPException(status_code=400, detail="Username is required")
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        raise HTTPException(status_code=400, detail="Invalid username. Use only letters, numbers, underscores, and hyphens.")
+    if batch > 50:
+        raise HTTPException(status_code=400, detail="Batch count cannot exceed 50")
+
+    # Check script exists
+    if not USER_ADD_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="user-add.sh not found. Is /project mounted?")
+
+    # Build command
+    cmd = ["bash", str(USER_ADD_SCRIPT)]
+    if batch > 0:
+        # Batch mode: username becomes prefix → alice_01, alice_02, ...
+        cmd += ["--batch", str(batch), "--prefix", name]
+    else:
+        # Single user mode
+        bundle_path = get_bundle_path()
+        if (bundle_path / name).exists():
+            raise HTTPException(status_code=409, detail=f"User '{name}' already exists")
+        cmd.append(name)
+
+    # Run the script (batch creates take longer — ~30s per user)
+    script_timeout = max(120, batch * 60) if batch > 0 else 120
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=script_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail=f"User creation timed out ({script_timeout}s)")
+
+    return {
+        "success": result.returncode == 0,
+        "output": result.stdout,
+        "errors": result.stderr if result.returncode != 0 else "",
+        "username": name if batch <= 0 else f"{name} (batch {batch})",
+    }
+
+
+# User bundle paths - check multiple possible locations
+BUNDLE_PATHS = [
+    Path("/project/outputs/bundles"),
+    Path("/outputs/bundles"),
+    Path("/app/outputs/bundles"),
+]
+
+
+def get_bundle_path():
+    """Find the bundles directory"""
+    for path in BUNDLE_PATHS:
+        if path.exists():
+            return path
+    return BUNDLE_PATHS[0]  # Default
+
+
+def list_users():
+    """List all users from bundles directory"""
+    users = []
+    bundle_path = get_bundle_path()
+
+    if not bundle_path.exists():
+        return users
+
+    for user_dir in bundle_path.iterdir():
+        # Skip non-directories and zip files
+        if not user_dir.is_dir():
+            continue
+        # Skip special directories
+        if user_dir.name.startswith('.') or user_dir.name.endswith('-configs'):
+            continue
+
+        username = user_dir.name
+
+        # Check what files exist in the bundle
+        has_reality = (user_dir / "reality.txt").exists()
+        has_wireguard = (user_dir / "wireguard.conf").exists()
+        has_hysteria2 = (user_dir / "hysteria2.yaml").exists() or (user_dir / "hysteria2.txt").exists()
+        has_trojan = (user_dir / "trojan.txt").exists()
+        has_trusttunnel = (user_dir / "trusttunnel.toml").exists() or (user_dir / "trusttunnel.txt").exists()
+        has_cdn = (user_dir / "cdn-vless.txt").exists()
+        has_amneziawg = (user_dir / "amneziawg.conf").exists()
+        has_telemt = (user_dir / "telegram-proxy-link.txt").exists()
+        has_dnstt = (user_dir / "dnstt-instructions.txt").exists()
+        has_slipstream = (user_dir / "slipstream-instructions.txt").exists() or (user_dir / "slipstream-cert.pem").exists()
+
+        # Check if zip already exists
+        zip_exists = (bundle_path / f"{username}.zip").exists()
+
+        # Get creation date from directory modification time
+        created_at = datetime.fromtimestamp(user_dir.stat().st_mtime)
+
+        users.append({
+            "username": username,
+            "has_reality": has_reality,
+            "has_wireguard": has_wireguard,
+            "has_hysteria2": has_hysteria2,
+            "has_trojan": has_trojan,
+            "has_trusttunnel": has_trusttunnel,
+            "has_cdn": has_cdn,
+            "has_amneziawg": has_amneziawg,
+            "has_telemt": has_telemt,
+            "has_dnstt": has_dnstt,
+            "has_slipstream": has_slipstream,
+            "zip_exists": zip_exists,
+            "created_at": created_at,
+        })
+
+    # Sort by creation date, newest first
+    users.sort(key=lambda u: u["created_at"], reverse=True)
+
+    return users
+
+
+@app.get("/download/{username}")
+async def download_bundle(username: str, _: str = Depends(verify_auth)):
+    """Download user bundle as zip file"""
+    bundle_path = get_bundle_path()
+    user_dir = bundle_path / username
+
+    # Security: validate username (no path traversal)
+    if ".." in username or "/" in username or "\\" in username:
+        raise HTTPException(status_code=400, detail="Invalid username")
+
+    if not user_dir.exists() or not user_dir.is_dir():
+        raise HTTPException(status_code=404, detail="User bundle not found")
+
+    # Check if pre-packaged zip exists
+    zip_path = bundle_path / f"{username}.zip"
+    if zip_path.exists():
+        # Serve existing zip
+        def iter_file():
+            with open(zip_path, "rb") as f:
+                yield from f
+        return StreamingResponse(
+            iter_file(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={username}.zip"}
+        )
+
+    # Create zip on-the-fly
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in user_dir.rglob("*"):
+            if file_path.is_file():
+                arcname = file_path.relative_to(user_dir)
+                zf.write(file_path, arcname)
+
+    zip_buffer.seek(0)
+
+    return StreamingResponse(
+        iter([zip_buffer.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={username}.zip"}
+    )
+
+
+def find_certificates(wait_for_letsencrypt=True, max_wait=60):
+    """
+    Find SSL certificates with priority: Let's Encrypt > Self-signed
+
+    Args:
+        wait_for_letsencrypt: If True, wait for Let's Encrypt certs to appear
+        max_wait: Maximum seconds to wait for Let's Encrypt certs
+
+    Returns:
+        Tuple of (ssl_keyfile, ssl_certfile) or (None, None)
+    """
+    import glob
+    import time
+
+    # Check for self-signed first to determine if we're in domain-less mode
+    selfsigned_key = "/certs/selfsigned/privkey.pem"
+    selfsigned_cert = "/certs/selfsigned/fullchain.pem"
+    has_selfsigned = Path(selfsigned_key).exists() and Path(selfsigned_cert).exists()
+
+    # Wait for Let's Encrypt certs if requested
+    if wait_for_letsencrypt:
+        waited = 0
+        check_interval = 5
+        print(f"Waiting for Let's Encrypt certificate (up to {max_wait}s)...")
+
+        while waited < max_wait:
+            cert_dirs = glob.glob("/certs/live/*/")
+            for cert_dir in cert_dirs:
+                # Skip README-only directories
+                key_path = f"{cert_dir}privkey.pem"
+                cert_path = f"{cert_dir}fullchain.pem"
+                if Path(key_path).exists() and Path(cert_path).exists():
+                    print(f"Found Let's Encrypt certificate from {cert_dir}")
+                    return key_path, cert_path
+
+            # If we have self-signed, we might be in domain-less mode
+            # Don't wait too long in that case
+            if has_selfsigned and waited >= 15:
+                print("Self-signed cert exists, assuming domain-less mode")
+                break
+
+            time.sleep(check_interval)
+            waited += check_interval
+            if waited < max_wait:
+                print(f"  Still waiting... ({waited}s)")
+
+    # Check one more time without waiting
+    cert_dirs = glob.glob("/certs/live/*/")
+    for cert_dir in cert_dirs:
+        key_path = f"{cert_dir}privkey.pem"
+        cert_path = f"{cert_dir}fullchain.pem"
+        if Path(key_path).exists() and Path(cert_path).exists():
+            print(f"Using Let's Encrypt certificate from {cert_dir}")
+            return key_path, cert_path
+
+    # Fallback to self-signed certificate (domain-less mode)
+    if has_selfsigned:
+        print("Using self-signed certificate (domain-less mode)")
+        return selfsigned_key, selfsigned_cert
+
+    return None, None
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Find certificate files (waits for Let's Encrypt if needed)
+    ssl_keyfile, ssl_certfile = find_certificates(wait_for_letsencrypt=True, max_wait=60)
+
+    if not ssl_keyfile:
+        print("WARNING: No SSL certificates found, running without HTTPS")
+
+    # Run with SSL if certs found
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8443,
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
+    )

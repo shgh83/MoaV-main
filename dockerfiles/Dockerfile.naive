@@ -2,17 +2,17 @@
 # Traffic looks identical to legitimate HTTPS browsing; no pattern for DPI.
 # Clients authenticate with username:password over HTTP CONNECT proxy (H2).
 # Source: https://github.com/klzgrad/naiveproxy / https://github.com/klzgrad/forwardproxy
-#
-# Uses the official xcaddy builder image instead of a bare Go image — it ships
-# the correct Go toolchain version and module cache, avoiding the xcaddy@latest
-# compatibility errors that occur with golang:1.22.
-FROM ghcr.io/caddyserver/xcaddy:latest AS builder
+FROM golang:1.24-alpine AS builder
 
 ARG TARGETARCH
 ARG TARGETOS=linux
 ARG CADDY_VERSION=2.9.1
 
+RUN apk add --no-cache git ca-certificates
+
+# Install xcaddy and build Caddy with naiveproxy forwardproxy plugin in one layer
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
     xcaddy build v${CADDY_VERSION} \
         --with github.com/klzgrad/forwardproxy@naive \
